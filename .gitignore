@@ -60,3 +60,6 @@ htmlcov/
 mlruns/
 mlartifacts/
 airflow.db
+
+# Incidental PowerShell module-analysis cache created in this workspace
+/Microsoft/Windows/PowerShell/ModuleAnalysisCache

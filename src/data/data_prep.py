@@ -74,6 +74,23 @@ def _validate_config(cfg: TrajectoryConfig) -> None:
         raise ValueError("max_animals must be positive or None.")
 
 
+def _select_animals_in_order(
+    animal_ids,
+    selected_animals: set,
+    max_animals: Optional[int],
+) -> None:
+    """Mutate selection state using the first valid animal IDs encountered."""
+    if max_animals is None:
+        selected_animals.update(animal_ids)
+        return
+    for animal_id in pd.unique(animal_ids):
+        if animal_id in selected_animals:
+            continue
+        if len(selected_animals) >= max_animals:
+            break
+        selected_animals.add(animal_id)
+
+
 def _load_movebank_gps(
     csv_path: str,
     max_animals: Optional[int] = None,
@@ -114,7 +131,13 @@ def _load_movebank_gps(
         )
 
         for chunk in reader:
-            # Missing identifiers or timestamps cannot define a reliable track.
+            # Parse timestamps explicitly: pandas' parse_dates may leave an
+            # object column when even one malformed value is present.
+            chunk["timestamp"] = pd.to_datetime(
+                chunk["timestamp"], errors="coerce", utc=True
+            )
+
+            # Missing identifiers or invalid timestamps cannot define a track.
             chunk = chunk.dropna(
                 subset=[
                     "timestamp",
@@ -123,6 +146,8 @@ def _load_movebank_gps(
                     "location-lat",
                 ]
             )
+            valid_identifiers = chunk["individual-local-identifier"].astype(str).str.strip().ne("")
+            chunk = chunk.loc[valid_identifiers].copy()
 
             if chunk.empty:
                 continue
@@ -150,16 +175,11 @@ def _load_movebank_gps(
 
             # Select animals deterministically in order of first appearance.
             if max_animals is not None:
-                for animal_id in chunk[
-                    "individual-local-identifier"
-                ].unique():
-                    if animal_id in selected_animals:
-                        continue
-
-                    if len(selected_animals) >= max_animals:
-                        break
-
-                    selected_animals.add(animal_id)
+                _select_animals_in_order(
+                    chunk["individual-local-identifier"],
+                    selected_animals,
+                    max_animals,
+                )
 
                 chunk = chunk[
                     chunk["individual-local-identifier"].isin(
