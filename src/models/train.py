@@ -1,6 +1,9 @@
 import argparse
 import os
+import random
 from typing import Tuple
+
+import numpy as np
 
 import torch
 from torch.utils.data import DataLoader
@@ -13,7 +16,19 @@ from src.data.data_prep import (
     build_trajectory_sequences,
 )
 from src.models.model import build_model
+from src.monitoring.metrics import haversine_distance_km
 
+def set_seed(seed: int) -> None:
+    """Set random seeds for more reproducible training."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def make_loaders(
     data_path: str,
@@ -81,6 +96,68 @@ def eval_epoch(
     return total_loss / len(loader.dataset)
 
 
+@torch.no_grad()
+def evaluate_ade(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> float:
+    """Calculate mean geographic displacement error in kilometres."""
+    model.eval()
+    total_distance = 0.0
+    total_points = 0
+
+    for past, future in loader:
+        past = past.to(device)
+        future = future.to(device)
+
+        predictions = model(past)
+
+        distances = haversine_distance_km(predictions, future)
+
+        total_distance += distances.sum().item()
+        total_points += distances.numel()
+
+    if total_points == 0:
+        raise ValueError("Cannot calculate ADE on an empty data loader.")
+
+    return total_distance / total_points
+
+
+@torch.no_grad()
+def evaluate_fde(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+) -> float:
+    """Calculate mean geographic error at the final forecast step."""
+    model.eval()
+    total_distance = 0.0
+    total_sequences = 0
+
+    for past, future in loader:
+        past = past.to(device)
+        future = future.to(device)
+
+        predictions = model(past)
+
+        final_predictions = predictions[:, -1, :]
+        final_targets = future[:, -1, :]
+
+        distances = haversine_distance_km(
+            final_predictions,
+            final_targets,
+        )
+
+        total_distance += distances.sum().item()
+        total_sequences += distances.numel()
+
+    if total_sequences == 0:
+        raise ValueError("Cannot calculate FDE on an empty data loader.")
+
+    return total_distance / total_sequences
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train LSTM trajectory forecaster on Movebank GPS data.")
     parser.add_argument("--data-path", type=str, required=True, help="Path to GPS CSV file.")
@@ -97,9 +174,13 @@ def main():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--out-dir", type=str, default="checkpoints")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    set_seed(args.seed)
+
     device = torch.device(args.device)
+    print(f"Random seed: {args.seed}", flush=True)
 
     traj_cfg = TrajectoryConfig(
         input_length=args.input_length,
@@ -151,9 +232,37 @@ def main():
             )
             print(f"  Saved new best model to {ckpt_path}", flush=True)
 
-    # Final test evaluation
+    # Evaluate the best checkpoint on the test set.
+    ckpt_path = os.path.join(out_dir, "trajectory_lstm.pt")
+
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(
+            f"No model checkpoint found at {ckpt_path}"
+        )
+
+    checkpoint = torch.load(
+        ckpt_path,
+        map_location=device,
+        weights_only=True,
+    )
+    model.load_state_dict(checkpoint["model_state"])
+
     test_loss = eval_epoch(model, test_loader, criterion, device)
-    print(f"Test loss (MSE on coordinates): {test_loss:.4f}")
+    test_ade_km = evaluate_ade(model, test_loader, device)
+    test_fde_km = evaluate_fde(model, test_loader, device)
+
+    print(
+        f"Best validation loss: {best_val_loss:.6f} | "
+        f"Test MSE (coordinate degrees squared): {test_loss:.6f}",
+        flush=True,
+    )
+    print(
+        f"Test ADE: {test_ade_km:.3f} km | "
+        f"Test FDE: {test_fde_km:.3f} km",
+        flush=True,
+    )
+
+
 
 
 if __name__ == "__main__":
