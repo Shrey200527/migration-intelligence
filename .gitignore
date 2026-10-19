@@ -34,6 +34,8 @@ data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
+# Synthetic test datasets
+data/test/*.csv
 
 # Model checkpoints and generated artifacts
 *.pt
