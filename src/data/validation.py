@@ -186,6 +186,7 @@ def validate_dataset(
             "error": "Required dataset columns are missing.",
             "counts": counts,
             "config": {**asdict(cfg), "max_animals": effective_max},
+            "split": {"val_size": val_size, "test_size": test_size},
         }
 
     required_points = cfg.input_length + cfg.forecast_horizon
@@ -223,6 +224,7 @@ def validate_dataset(
         "tracks_below_minimum_for_splits": int(short),
         "minimum_points_per_track_for_splits": minimum_for_splits,
         "config": {**asdict(cfg), "max_animals": effective_max},
+        "split": {"val_size": val_size, "test_size": test_size},
         "count_semantics": {
             "rows": "all raw CSV rows",
             "invalid_*": "all raw CSV rows; reason counts can overlap",

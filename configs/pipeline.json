@@ -1,0 +1,31 @@
+{
+  "data": {
+    "raw_path": "data/raw/movebank.csv",
+    "max_animals": 10,
+    "validation_report": "artifacts/pipeline/dataset_quality.json",
+    "validation_summary": "artifacts/pipeline/dataset_quality.md",
+    "prepared_dir": "data/processed/prepared"
+  },
+  "trajectory": {
+    "input_length": 20,
+    "forecast_horizon": 5,
+    "min_points_per_track": 50,
+    "val_size": 0.15,
+    "test_size": 0.15
+  },
+  "training": {
+    "seed": 42,
+    "batch_size": 64,
+    "epochs": 10,
+    "learning_rate": 0.001,
+    "hidden_size": 128,
+    "num_layers": 2,
+    "dropout": 0.2,
+    "num_workers": 0,
+    "device": "cpu",
+    "data_kind": "unspecified",
+    "strict_determinism": false,
+    "evaluation_dir": "artifacts/pipeline/evaluation",
+    "diagnostics_dir": "artifacts/pipeline/diagnostics"
+  }
+}

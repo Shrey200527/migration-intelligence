@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+import io
 import json
 import math
 import os
@@ -20,7 +21,8 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.optim as optim
 
-from src.data.data_prep import TrajectoryConfig, TrajectoryDataset, build_trajectory_sequences
+from src.data.data_prep import (TrajectoryConfig, TrajectoryDataset, build_trajectory_sequences,
+                                load_prepared_sequences)
 from src.data.validation import validate_dataset, write_quality_report
 from src.models.baseline import persistence_forecast
 from src.models.model import build_model
@@ -152,7 +154,13 @@ def evaluate_fde(model: nn.Module, loader: DataLoader, device: torch.device) -> 
 
 def _atomic_torch_save(value: Any, path: Path) -> None:
     fd, temp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)); os.close(fd)
-    try: torch.save(value, temp); os.replace(temp, path)
+    try:
+        # Saving through a buffer avoids embedding the random atomic-temp filename
+        # in PyTorch's ZIP member names, allowing repeatable checkpoint bytes.
+        buffer = io.BytesIO()
+        torch.save(value, buffer)
+        with open(temp, "wb") as stream: stream.write(buffer.getvalue())
+        os.replace(temp, path)
     finally:
         if os.path.exists(temp): os.unlink(temp)
 
@@ -193,7 +201,10 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def run_training(args: argparse.Namespace) -> Path:
     _validate_args(args)
-    if not Path(args.data_path).is_file(): raise FileNotFoundError(f"GPS dataset not found: {args.data_path}")
+    if args.prepared_dir:
+        if not Path(args.prepared_dir).is_dir(): raise FileNotFoundError(f"Prepared data directory not found: {args.prepared_dir}")
+    elif not args.data_path or not Path(args.data_path).is_file():
+        raise FileNotFoundError(f"GPS dataset not found: {args.data_path}")
     set_seed(args.seed)
     with _deterministic_training(strict=args.strict_determinism):
         return _run_training(args)
@@ -202,28 +213,49 @@ def run_training(args: argparse.Namespace) -> Path:
 def _run_training(args: argparse.Namespace) -> Path:
     device = torch.device(args.device)
     traj_cfg = TrajectoryConfig(args.input_length, args.forecast_horizon, args.min_points, args.max_animals)
-    report = validate_dataset(
-        args.data_path,
-        traj_cfg,
-        val_size=args.val_size,
-        test_size=args.test_size,
-        max_animals=traj_cfg.max_animals,
-    )
-    if not report.get("usable", False): raise ValueError(f"Dataset is unusable: {report.get('error', 'validation failed')}")
-    train_loader, val_loader, test_loader = make_loaders(args.data_path, traj_cfg, args.batch_size,
-                                                        args.num_workers, args.test_size, args.val_size,
-                                                        seed=args.seed)
-    # Use a unique run subdirectory so prior artifacts are never silently replaced.
-    root = Path(args.out_dir); root.mkdir(parents=True, exist_ok=True)
-    run_dir = root / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f"); run_dir.mkdir()
-    write_quality_report(report, run_dir / "dataset_quality.json", run_dir / "dataset_quality.md")
+    if args.prepared_dir:
+        (train, val, test), manifest = load_prepared_sequences(
+            args.prepared_dir, traj_cfg, expected_test_size=args.test_size,
+            expected_val_size=args.val_size)
+        quality_file = Path(args.prepared_dir) / "dataset_quality.json"
+        report = json.loads(quality_file.read_text(encoding="utf-8")) if quality_file.is_file() else {
+            "counts": {"rows": 0, "invalid_records": 0, "duplicate_records": 0},
+            "valid_observations": 0, "individual_count": 0, "tracks_below_minimum_for_splits": 0,
+            "selection": {"selected_individual_count": 0}, "prepared_manifest": manifest}
+        generator = torch.Generator().manual_seed(args.seed)
+        train_loader = DataLoader(TrajectoryDataset(train), batch_size=args.batch_size, shuffle=True,
+                                  num_workers=args.num_workers, generator=generator)
+        val_loader = DataLoader(TrajectoryDataset(val), batch_size=args.batch_size, shuffle=False,
+                                num_workers=args.num_workers)
+        test_loader = DataLoader(TrajectoryDataset(test), batch_size=args.batch_size, shuffle=False,
+                                 num_workers=args.num_workers)
+        data_name = "prepared_sequences"
+    else:
+        report = validate_dataset(args.data_path, traj_cfg, val_size=args.val_size,
+                                  test_size=args.test_size, max_animals=traj_cfg.max_animals)
+        if not report.get("usable", False): raise ValueError(f"Dataset is unusable: {report.get('error', 'validation failed')}")
+        train_loader, val_loader, test_loader = make_loaders(args.data_path, traj_cfg, args.batch_size,
+                                                            args.num_workers, args.test_size, args.val_size,
+                                                            seed=args.seed)
+        data_name = Path(args.data_path).name
+    # Canonical pipeline output is stable; legacy output remains per-run.
+    if args.canonical_output:
+        run_dir = Path(args.canonical_output); run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        root = Path(args.out_dir); root.mkdir(parents=True, exist_ok=True)
+        run_dir = root / datetime.now().strftime("run_%Y%m%d_%H%M%S_%f"); run_dir.mkdir()
+    if not args.prepared_dir:
+        write_quality_report(report, run_dir / "dataset_quality.json", run_dir / "dataset_quality.md")
     model, model_cfg = build_model(hidden_size=args.hidden_size, num_layers=args.num_layers,
                                    dropout=args.dropout, forecast_horizon=args.forecast_horizon)
     model.to(device); criterion = nn.MSELoss(); optimizer = optim.Adam(model.parameters(), lr=args.lr)
     best_val = float("inf"); history = []; started = time.perf_counter(); checkpoint_path = run_dir / "trajectory_lstm.pt"
     safe_settings = vars(args).copy()
-    safe_settings["data_path"] = Path(args.data_path).name
+    safe_settings["data_path"] = Path(args.data_path).name if args.data_path else None
+    safe_settings["prepared_dir"] = Path(args.prepared_dir).name if args.prepared_dir else None
     safe_settings["out_dir"] = Path(args.out_dir).name
+    safe_settings["canonical_output"] = Path(args.canonical_output).name if args.canonical_output else None
+    safe_settings["diagnostics_dir"] = Path(args.diagnostics_dir).name if args.diagnostics_dir else None
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
@@ -246,25 +278,35 @@ def _run_training(args: argparse.Namespace) -> Path:
     test_mse = eval_epoch(model, test_loader, criterion, device)
     lstm_ade, lstm_fde = _evaluate_distances(model, test_loader, device)
     base_ade, base_fde = _evaluate_distances(lambda x: persistence_forecast(x, args.forecast_horizon), test_loader, device)
+    canonical_output = bool(args.canonical_output)
+    if canonical_output:
+        diagnostics_dir = Path(args.diagnostics_dir) if args.diagnostics_dir else run_dir.with_name(run_dir.name + "_diagnostics")
+        diagnostics_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_json({"epoch_elapsed_seconds": [entry["elapsed_seconds"] for entry in history],
+                      "total_training_seconds": time.perf_counter() - started},
+                     diagnostics_dir / "runtime_diagnostics.json")
     summary = {
         "experiment_type": "dataset_training", "data_kind": args.data_kind,
         "data_kind_note": "Not independently verified; user must identify whether the input is real or synthetic.",
-        "data_file_name": Path(args.data_path).name,
+        "data_file_name": data_name,
         "configuration": safe_settings, "seed": args.seed, "device": str(device),
         "python_version": platform.python_version(), "pytorch_version": torch.__version__,
         "model_configuration": model_cfg.__dict__, "trajectory_configuration": traj_cfg.__dict__,
-        "training_validation_history": history, "best_validation_loss_mse_degrees_squared": best_val,
+        "training_validation_history": ([{k: v for k, v in entry.items() if k != "elapsed_seconds"}
+                                          for entry in history] if canonical_output else history),
+        "best_validation_loss_mse_degrees_squared": best_val,
         "test_metrics": {"lstm_mse_degrees_squared": test_mse, "lstm_ade_km": lstm_ade,
                          "lstm_fde_km": lstm_fde, "persistence_ade_km": base_ade,
                          "persistence_fde_km": base_fde,
                          "ade_comparison": _comparison(base_ade, lstm_ade),
                          "fde_comparison": _comparison(base_fde, lstm_fde)},
-        "total_training_seconds": time.perf_counter() - started,
     }
+    if not canonical_output:
+        summary["total_training_seconds"] = time.perf_counter() - started
     _atomic_json(summary, run_dir / "experiment_summary.json")
     m = summary["test_metrics"]
     md = ("# Trajectory forecasting experiment\n\n"
-          f"Dataset: `{Path(args.data_path).name}` (source label: {args.data_kind}).\n\n"
+          f"Dataset: `{data_name}` (source label: {args.data_kind}).\n\n"
           f"Data profile: {report['counts']['rows']} rows, {report.get('valid_observations', 0)} valid observations, "
           f"{report.get('individual_count', 0)} individuals, {report['counts']['invalid_records']} invalid records, "
           f"{report['counts']['duplicate_records']} duplicate records, and "
@@ -286,7 +328,10 @@ def _run_training(args: argparse.Namespace) -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train an LSTM trajectory forecaster and compare with persistence")
-    parser.add_argument("--data-path", required=True); parser.add_argument("--input-length", type=int, default=20)
+    parser.add_argument("--data-path"); parser.add_argument("--prepared-dir")
+    parser.add_argument("--canonical-output", help="Stable output directory for pipeline use; replaces files in that directory.")
+    parser.add_argument("--diagnostics-dir", help="Separate directory for nondeterministic runtime timing diagnostics.")
+    parser.add_argument("--input-length", type=int, default=20)
     parser.add_argument("--forecast-horizon", type=int, default=5); parser.add_argument("--min-points", type=int, default=50)
     parser.add_argument("--max-animals", type=int, default=10); parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=10); parser.add_argument("--lr", type=float, default=1e-3)
@@ -304,6 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser(); args = parser.parse_args(argv)
+    if bool(args.data_path) == bool(args.prepared_dir):
+        parser.error("provide exactly one of --data-path or --prepared-dir")
     try: run_training(args)
     except (ValueError, OSError, RuntimeError) as exc:
         parser.exit(2, f"Training failed: {exc}\n")

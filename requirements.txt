@@ -4,3 +4,4 @@ pyarrow
 torch
 scikit-learn
 matplotlib
+dvc>=3.67.1,<4

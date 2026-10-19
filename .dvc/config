@@ -1,0 +1,4 @@
+[core]
+    analytics = false
+    check_update = false
+    autostage = false

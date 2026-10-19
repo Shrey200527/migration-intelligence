@@ -1,6 +1,6 @@
-# Migration Intelligence — Phase 1
+# Migration Intelligence - Phase 2 pipeline interfaces
 
-Phase 1 provides a scientific baseline for GPS trajectory forecasting: dataset checks, chronological sequence construction, an LSTM, a persistence baseline, and geographic evaluation. It does not include a serving API, deployment stack, orchestration, DVC, or MLflow.
+The project provides a scientific baseline for GPS trajectory forecasting and local scriptable stage interfaces: dataset checks, chronological sequence construction, persisted split artifacts, an LSTM, a persistence baseline, and geographic evaluation. DVC orchestrates the local validation, preparation, and training stages. MLflow is not included.
 
 ## Dataset
 
@@ -26,7 +26,7 @@ From the repository root, using the existing Windows virtual environment:
 ```
 
 The command returns a nonzero exit code when the schema is missing, no usable track exists, or the dataset cannot provide each split with at least one input/forecast window.
-It accepts `--max-animals`; the default is the first five valid individual IDs, matching the validation CLI configuration. Training defaults to ten; pass the same `--max-animals` value to validation when profiling for a training run.
+The legacy validation CLI accepts `--max-animals` and defaults to five. The shared pipeline configuration defaults to ten, matching training; use `python -m src.pipeline validate` to validate with the shared settings.
 
 ## Tests
 
@@ -63,3 +63,51 @@ Observations are sorted and split chronologically per individual before windows 
 ## Limitations
 
 No real Movebank dataset is checked into this repository. Synthetic tests validate the implementation, but do not establish real-world model performance. Run validation and training on an identified real dataset before drawing performance conclusions. Results depend on sampling cadence and data quality; the current model consumes raw degree coordinates and does not model irregular time gaps.
+
+## Reproducible pipeline interfaces
+
+`configs/pipeline.json` is the shared pipeline configuration. Relative data and output paths are resolved from the repository root, independent of the shell's current directory. Defaults preserve Phase 1 model and split settings; the shared animal limit is 10, matching the training CLI. Edit this JSON or pass stage-specific path overrides. Supported settings are:
+
+- `data.raw_path`, `data.max_animals`, `data.validation_report`, `data.validation_summary`, `data.prepared_dir`
+- `trajectory.input_length`, `trajectory.forecast_horizon`, `trajectory.min_points_per_track`, `trajectory.val_size`, `trajectory.test_size`
+- `training.seed`, `batch_size`, `epochs`, `learning_rate`, `hidden_size`, `num_layers`, `dropout`, `num_workers`, `device`, `data_kind`, `strict_determinism`, `evaluation_dir`, and `diagnostics_dir`
+
+Run from the repository root with the existing environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.pipeline validate --config configs/pipeline.json
+.\.venv\Scripts\python.exe -m src.pipeline prepare --config configs/pipeline.json
+.\.venv\Scripts\python.exe -m src.pipeline train --config configs/pipeline.json
+```
+
+To invoke the script from another working directory, use absolute paths for the interpreter and script; relative configuration and output paths still resolve from the repository root:
+
+```powershell
+D:\migration-intelligence\.venv\Scripts\python.exe D:\migration-intelligence\src\pipeline.py validate --config configs\pipeline.json
+```
+
+The explicit defaults can be overridden per stage, for example `--data-path C:\datasets\movebank.csv`, `--output .\artifacts\quality.json` on `validate`; `--output-dir .\data\processed\prepared` on `prepare`; and `--prepared-dir .\data\processed\prepared --output-dir .\artifacts\pipeline\evaluation` on `train`. All relative overrides remain repository-root-relative. Each command returns a nonzero status on failure. Validation and preparation report a missing raw CSV without printing its contents.
+
+Preparation writes `train.npz`, `validation.npz`, `test.npz`, and `manifest.json` to `data.prepared_dir`. Each compressed NPZ contains only `past` and `future` float32 arrays, with shapes `(sequence_count, input_length, 2)` and `(sequence_count, forecast_horizon, 2)` and feature order latitude then longitude. Loading uses `allow_pickle=False` and checks shapes, dtypes, finite/ranged coordinates, manifest counts, and configuration. The manifest contains split settings and aggregate sequence metadata, not GPS rows or animal identifiers. NPZ members use fixed ZIP timestamps so identical arrays produce stable files. Preparation also writes the aggregate validation report beside the arrays for convenient lineage.
+
+The train stage consumes these prepared files without opening or preprocessing the raw CSV. It writes canonical pipeline outputs to `artifacts/pipeline/evaluation` (checkpoint, JSON summary, and Markdown report). Runtime timings are written separately to `artifacts/pipeline/diagnostics/runtime_diagnostics.json`; they are excluded from canonical summaries. Repeated canonical CPU training with identical prepared files and settings produced byte-identical checkpoints in the regression test for the installed software environment. This is not a cross-version or cross-platform guarantee. The legacy `python -m src.models.train --data-path ...` workflow remains available and continues to create unique per-run directories under `artifacts/experiments`, retaining elapsed-time fields in its experiment reports.
+
+The pipeline stages are validation (raw CSV to quality JSON/Markdown), preparation (raw CSV and validation report to split arrays, manifest, and copied quality report), and training/evaluation (prepared arrays to checkpoint and evaluation report). Pipeline validation adds a streaming SHA-256 fingerprint of the source CSV to the aggregate report. Preparation compares the current CSV fingerprint, filename, trajectory settings, and split ratios before reusing a report; an old report without a fingerprint is rejected. When run by itself without a report, preparation validates the CSV in memory and writes its quality report only inside the prepared output directory. DVC also tracks the CSV and validation JSON dependency, so it schedules validation before preparation when the raw file changes.
+
+## Local DVC workflow
+
+DVC is declared in `requirements.txt` but was not installed as part of this change. Use an environment with the project dependencies and DVC 3.x installed, then run these commands from the repository root in PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+dvc dag
+dvc repro
+dvc status
+Get-Content .\artifacts\pipeline\evaluation\experiment_summary.json
+```
+
+The graph runs `validate`, `prepare`, then `train`. DVC tracks the stage definitions and parameters in `dvc.yaml` and `dvc.lock`; it caches declared outputs in the local `.dvc/cache`. `.dvc/config` disables analytics, update checks, and automatic Git staging. No DVC remote is configured, so the cache is local to this checkout and is not a backup or a transfer mechanism. Runtime diagnostics under `artifacts/pipeline/diagnostics` are deliberately excluded from canonical DVC outputs; the checkpoint, summary, and report are declared outputs. Checkpoint byte stability is limited to the tested software environment described above.
+
+To track a supplied raw CSV with DVC, run `dvc add data/raw/movebank.csv`. This creates `data/raw/movebank.csv.dvc`; the CSV itself stays ignored by Git. Keep DVC metadata and pointer files under Git using your normal manual Git workflow, for example `.dvc/config`, `.dvc/.gitignore`, `dvc.yaml`, `dvc.lock`, and the `.dvc` pointer file. Do not stage the raw CSV with Git. The ignore rules allow these pointer files without allowing generated data or pipeline outputs into Git. No Git commands are run by the pipeline or DVC configuration.
+
+Edit `configs/pipeline.json` to change stage parameters, then run `dvc repro`; DVC will rerun affected downstream stages. Use `dvc status` to inspect changed dependencies and `dvc dag` to inspect stage order. The machine-readable evaluation metrics are in `artifacts/pipeline/evaluation/experiment_summary.json`. DVC itself was unavailable in the current environment, so these DVC commands and DVC's parsing of `dvc.yaml` have not been executed here.
