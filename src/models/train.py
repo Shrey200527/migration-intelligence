@@ -14,7 +14,7 @@ import time
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
 import numpy as np
@@ -23,7 +23,8 @@ from torch.utils.data import DataLoader
 import torch.nn as nn
 import torch.optim as optim
 
-from src.data.data_prep import (TrajectoryConfig, TrajectoryDataset, build_trajectory_sequences,
+from src.data.data_prep import (TrajectoryConfig, TrajectoryDataset, _validate_config,
+                                _validate_split_sizes, build_trajectory_sequences,
                                 load_prepared_sequences)
 from src.data.validation import validate_dataset, write_quality_report
 from src.models.baseline import persistence_forecast
@@ -294,16 +295,51 @@ def _comparison(baseline: float, lstm: float) -> Dict[str, Any]:
             "percentage_status": "defined" if percentage is not None else "undefined: baseline is zero"}
 
 
+def validate_training_parameters(settings: Mapping[str, Any], *, label_prefix: str = "training.") -> None:
+    """Validate shared training scalars for both config and standalone CLI entry points."""
+    aliases = {"learning_rate": "lr"}
+
+    def label(name: str) -> str:
+        display_name = aliases.get(name, name).replace("_", "-") if label_prefix == "--" else name
+        return f"{label_prefix}{display_name}"
+
+    integer_fields = ("seed", "batch_size", "epochs", "hidden_size", "num_layers", "num_workers")
+    for name in integer_fields:
+        value = settings.get(name)
+        if type(value) is not int:
+            raise ValueError(f"{label(name)} must be an integer")
+    if settings["seed"] < 0:
+        raise ValueError(f"{label('seed')} must be non-negative")
+    for name in ("batch_size", "epochs", "hidden_size", "num_layers"):
+        if settings[name] < 1:
+            raise ValueError(f"{label(name)} must be positive")
+    if settings["num_workers"] < 0:
+        raise ValueError(f"{label('num_workers')} cannot be negative")
+
+    learning_rate = settings.get("learning_rate")
+    if (isinstance(learning_rate, bool) or not isinstance(learning_rate, (int, float))
+            or not math.isfinite(learning_rate) or learning_rate <= 0):
+        raise ValueError(f"{label('learning_rate')} must be a finite positive number")
+    dropout = settings.get("dropout")
+    if (isinstance(dropout, bool) or not isinstance(dropout, (int, float))
+            or not math.isfinite(dropout) or not 0 <= dropout < 1):
+        raise ValueError(f"{label('dropout')} must be finite and in [0, 1)")
+
+
 def _validate_args(args: argparse.Namespace) -> None:
-    for field in ("epochs", "batch_size", "lr", "hidden_size", "num_layers", "input_length", "forecast_horizon", "min_points"):
-        if getattr(args, field) <= 0: raise ValueError(f"--{field.replace('_', '-')} must be positive")
-    if args.num_workers < 0: raise ValueError("--num-workers cannot be negative")
-    if not 0 <= args.dropout < 1: raise ValueError("--dropout must be in [0, 1)")
-    if args.val_size <= 0 or args.test_size <= 0 or args.val_size + args.test_size >= 1:
-        raise ValueError("--val-size and --test-size must be positive and sum to less than 1")
-    if args.min_points < args.input_length + args.forecast_horizon:
-        raise ValueError("--min-points must be at least input-length + forecast-horizon")
-    if args.lr <= 0: raise ValueError("--lr must be positive")
+    validate_training_parameters({
+        "seed": args.seed,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "learning_rate": args.lr,
+        "hidden_size": args.hidden_size,
+        "num_layers": args.num_layers,
+        "num_workers": args.num_workers,
+        "dropout": args.dropout,
+    }, label_prefix="--")
+    _validate_config(TrajectoryConfig(args.input_length, args.forecast_horizon,
+                                      args.min_points, args.max_animals))
+    _validate_split_sizes(args.test_size, args.val_size)
     if not args.mlflow_experiment_name.strip():
         raise ValueError("--mlflow-experiment-name must be non-empty")
     normalize_local_tracking_uri(args.mlflow_tracking_uri)

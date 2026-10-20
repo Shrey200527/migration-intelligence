@@ -71,7 +71,7 @@ No real Movebank dataset is checked into this repository. Synthetic tests valida
 - `data.raw_path`, `data.max_animals`, `data.validation_report`, `data.validation_summary`, `data.prepared_dir`
 - `trajectory.input_length`, `trajectory.forecast_horizon`, `trajectory.min_points_per_track`, `trajectory.val_size`, `trajectory.test_size`
 - `training.seed`, `batch_size`, `epochs`, `learning_rate`, `hidden_size`, `num_layers`, `dropout`, `num_workers`, `device`, `data_kind`, `strict_determinism`, `evaluation_dir`, and `diagnostics_dir`
-- `mlflow.tracking_uri` (local directory or `file:` URI) and `mlflow.experiment_name`
+- `mlflow.tracking_uri` (local SQLite URI such as `sqlite:///mlruns/mlflow.db`, or a local database path) and `mlflow.experiment_name`. `file:` tracking URIs and hosted tracking URIs are rejected.
 
 Run from the repository root with the existing environment:
 
@@ -119,7 +119,7 @@ The pipeline stages are validation (raw CSV to quality JSON/Markdown), preparati
 
 ## Local DVC workflow
 
-DVC is declared in `requirements.txt` but was not installed as part of this change. Use an environment with the project dependencies and DVC 3.x installed, then run these commands from the repository root in PowerShell:
+DVC 3.x is declared in `requirements.txt`. DVC 3.67.1 successfully parsed this repository's graph with `dvc dag` during the latest audit, using a temporary DVC cache/config location to avoid a machine-level cache permission error. That graph check does not verify stage execution; a full `dvc repro` was not run during that audit. Use the project environment from the repository root in PowerShell:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
@@ -133,4 +133,4 @@ The graph runs `validate`, `prepare`, then `train`. DVC tracks the stage definit
 
 To track a supplied raw CSV with DVC, run `dvc add data/raw/movebank.csv`. This creates `data/raw/movebank.csv.dvc`; the CSV itself stays ignored by Git. Keep DVC metadata and pointer files under Git using your normal manual Git workflow, for example `.dvc/config`, `.dvc/.gitignore`, `dvc.yaml`, `dvc.lock`, and the `.dvc` pointer file. Do not stage the raw CSV with Git. The ignore rules allow these pointer files without allowing generated data or pipeline outputs into Git. No Git commands are run by the pipeline or DVC configuration.
 
-Edit `configs/pipeline.json` to change stage parameters, then run `dvc repro`; DVC will rerun affected downstream stages. Use `dvc status` to inspect changed dependencies and `dvc dag` to inspect stage order. The machine-readable evaluation metrics are in `artifacts/pipeline/evaluation/experiment_summary.json`. DVC itself was unavailable in the current environment, so these DVC commands and DVC's parsing of `dvc.yaml` have not been executed here.
+Edit `configs/pipeline.json` to change stage parameters, then run `dvc repro`; DVC will rerun affected downstream stages. Use `dvc status` to inspect changed dependencies and `dvc dag` to inspect stage order. The machine-readable evaluation metrics are in `artifacts/pipeline/evaluation/experiment_summary.json`. The graph has been parsed with DVC, but this does not establish that the current configuration can reproduce stages; full reproduction requires a supplied raw CSV and has not been repeated as part of the latest audit.

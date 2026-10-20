@@ -1,5 +1,7 @@
-"""Offline MLflow integration checks using a small in-memory tracking client."""
+"""Mocked and native offline MLflow integration checks."""
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -23,6 +25,39 @@ def _write_fixture(path: Path) -> None:
                          "location-long": 10 + i * .001,
                          "location-lat": 40 + i * .001})
     pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _assert_isolated_process_succeeded(test_case: unittest.TestCase, script: str, *args: str) -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-c", script, *args], cwd=project_root,
+        capture_output=True, text=True, check=False,
+    )
+    test_case.assertEqual(result.returncode, 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
+
+
+def _args_to_cli(args) -> list[str]:
+    options = {
+        "data_path": "--data-path", "prepared_dir": "--prepared-dir",
+        "canonical_output": "--canonical-output", "diagnostics_dir": "--diagnostics-dir",
+        "input_length": "--input-length", "forecast_horizon": "--forecast-horizon",
+        "min_points": "--min-points", "max_animals": "--max-animals",
+        "batch_size": "--batch-size", "epochs": "--epochs", "lr": "--lr",
+        "hidden_size": "--hidden-size", "num_layers": "--num-layers",
+        "dropout": "--dropout", "num_workers": "--num-workers", "device": "--device",
+        "out_dir": "--out-dir", "seed": "--seed", "test_size": "--test-size",
+        "val_size": "--val-size", "data_kind": "--data-kind",
+        "mlflow_tracking_uri": "--mlflow-tracking-uri",
+        "mlflow_experiment_name": "--mlflow-experiment-name",
+    }
+    result = []
+    for name, value in vars(args).items():
+        if name == "strict_determinism":
+            if value:
+                result.append("--strict-determinism")
+        elif value is not None:
+            result.extend((options[name], str(value)))
+    return result
 
 
 class _FakeMLflow:
@@ -63,6 +98,136 @@ class _FakeMLflow:
 
 
 class MlflowTrackingTests(unittest.TestCase):
+    def test_native_mlflow_client_run_logs_and_retrieves_artifact(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            tracking_dir = root / "tracking"
+            tracking_dir.mkdir()
+            tracking_uri = normalize_local_tracking_uri(str(tracking_dir / "mlflow.db"))
+            script = r"""
+import sys
+from pathlib import Path
+from mlflow.tracking import MlflowClient
+from src.models.train import local_mlflow_artifact_uri
+
+root = Path(sys.argv[1])
+tracking_uri = sys.argv[2]
+client = MlflowClient(tracking_uri=tracking_uri)
+experiment_id = client.create_experiment(
+    "native-client-test", artifact_location=local_mlflow_artifact_uri(tracking_uri))
+run_id = client.create_run(experiment_id).info.run_id
+artifact = root / "sample.txt"
+artifact.write_text("native artifact payload", encoding="utf-8")
+try:
+    client.log_param(run_id, "seed", "17")
+    client.log_metric(run_id, "validation_loss", 0.25, step=1)
+    client.log_artifact(run_id, str(artifact))
+except BaseException:
+    client.set_terminated(run_id, status="FAILED")
+    raise
+else:
+    client.set_terminated(run_id, status="FINISHED")
+
+finished = client.get_run(run_id)
+assert finished.info.status == "FINISHED"
+assert finished.info.experiment_id == experiment_id
+assert client.get_experiment(experiment_id).name == "native-client-test"
+assert finished.data.params["seed"] == "17"
+assert finished.data.metrics["validation_loss"] == 0.25
+downloaded = client.download_artifacts(run_id, "sample.txt", str(root / "downloads"))
+assert Path(downloaded).read_text(encoding="utf-8") == "native artifact payload"
+"""
+            _assert_isolated_process_succeeded(self, script, str(root), tracking_uri)
+
+    def test_native_training_logs_evaluation_and_retrievable_checkpoint(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            csv = root / "fixture.csv"
+            _write_fixture(csv)
+            prepared = root / "prepared"
+            config = TrajectoryConfig(3, 2, 5, 2)
+            sequences = build_trajectory_sequences(str(csv), config, test_size=.15, val_size=.15)
+            save_prepared_sequences(prepared, sequences, config, .15, .15, random_state=17)
+            database = root / "tracking" / "mlflow.db"
+            database.parent.mkdir()
+            tracking_uri = normalize_local_tracking_uri(str(database))
+            args = build_parser().parse_args([
+                "--prepared-dir", str(prepared), "--input-length", "3", "--forecast-horizon", "2",
+                "--min-points", "5", "--max-animals", "2", "--batch-size", "16", "--epochs", "1",
+                "--lr", "0.002", "--hidden-size", "4", "--num-layers", "1", "--dropout", "0",
+                "--device", "cpu", "--seed", "17", "--data-kind", "synthetic",
+                "--canonical-output", str(root / "evaluation"), "--mlflow-tracking-uri", str(database),
+                "--mlflow-experiment-name", "native-training-test",
+            ])
+            script = r"""
+import json
+import sys
+from pathlib import Path
+from mlflow.tracking import MlflowClient
+from src.models.train import build_parser, run_training
+
+arguments = json.loads(sys.argv[1])
+tracking_uri = sys.argv[2]
+run_training(build_parser().parse_args(arguments))
+client = MlflowClient(tracking_uri=tracking_uri)
+experiment = client.get_experiment_by_name("native-training-test")
+assert experiment is not None
+runs = client.search_runs([experiment.experiment_id])
+assert len(runs) == 1
+run = runs[0]
+assert run.info.status == "FINISHED"
+assert run.info.experiment_id == experiment.experiment_id
+assert run.data.params["seed"] == "17"
+assert "validation_loss_mse_degrees_squared" in run.data.metrics
+assert "test_lstm_ade_km" in run.data.metrics
+assert "test_persistence_ade_km" in run.data.metrics
+artifacts = client.list_artifacts(run.info.run_id, "model")
+assert "trajectory_lstm.pt" in {item.path.rsplit("/", 1)[-1] for item in artifacts}
+checkpoint = client.download_artifacts(
+    run.info.run_id, "model/trajectory_lstm.pt", str(Path(arguments[arguments.index("--canonical-output") + 1]).parent / "downloads"))
+assert Path(checkpoint).stat().st_size > 0
+"""
+            _assert_isolated_process_succeeded(self, script, json.dumps(_args_to_cli(args)), tracking_uri)
+
+    def test_native_training_exception_marks_mlflow_run_failed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            prepared = root / "prepared"
+            prepared.mkdir()
+            database = root / "tracking" / "mlflow.db"
+            database.parent.mkdir()
+            tracking_uri = normalize_local_tracking_uri(str(database))
+            args = build_parser().parse_args([
+                "--prepared-dir", str(prepared), "--device", "cpu", "--seed", "17",
+                "--mlflow-tracking-uri", str(database), "--mlflow-experiment-name", "native-failure-test",
+            ])
+            script = r"""
+import json
+import sys
+from unittest.mock import patch
+from mlflow.entities import ViewType
+from mlflow.tracking import MlflowClient
+from src.models.train import build_parser, run_training
+
+arguments = json.loads(sys.argv[1])
+tracking_uri = sys.argv[2]
+with patch("src.models.train._run_training", side_effect=RuntimeError("controlled failure")):
+    try:
+        run_training(build_parser().parse_args(arguments))
+    except RuntimeError as exc:
+        assert str(exc) == "controlled failure"
+    else:
+        raise AssertionError("injected training exception was swallowed")
+client = MlflowClient(tracking_uri=tracking_uri)
+experiment = client.get_experiment_by_name("native-failure-test")
+assert experiment is not None
+runs = client.search_runs([experiment.experiment_id], run_view_type=ViewType.ALL)
+assert len(runs) == 1
+assert runs[0].info.status == "FAILED"
+assert runs[0].data.params["seed"] == "17"
+"""
+            _assert_isolated_process_succeeded(self, script, json.dumps(_args_to_cli(args)), tracking_uri)
+
     def test_sqlite_uri_resolution_and_local_only_restriction(self):
         repo_root = Path(__file__).resolve().parents[1]
         resolved = normalize_local_tracking_uri("sqlite:///mlruns/mlflow.db", base_dir=repo_root)

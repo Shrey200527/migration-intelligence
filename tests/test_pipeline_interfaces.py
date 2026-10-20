@@ -15,7 +15,8 @@ import pandas as pd
 from src.data.data_prep import (TrajectoryConfig, build_trajectory_sequences,
                                 load_prepared_sequences, save_prepared_sequences)
 from src.pipeline import load_config, main as pipeline_main
-from src.models.train import build_parser, main as train_main, run_training
+from src.models.train import (_validate_args, build_parser, main as train_main,
+                              run_training)
 
 
 def write_fixture(path: Path, observations: int = 120) -> None:
@@ -29,6 +30,56 @@ def write_fixture(path: Path, observations: int = 120) -> None:
 
 
 class PipelineInterfaceTests(unittest.TestCase):
+    def test_standalone_training_argument_validation_boundaries_and_invalid_values(self):
+        valid = build_parser().parse_args([])
+        valid.seed = 0
+        valid.batch_size = 1
+        valid.epochs = 1
+        valid.lr = 1e-12
+        valid.hidden_size = 1
+        valid.num_layers = 1
+        valid.dropout = 0.0
+        valid.num_workers = 0
+        valid.input_length = 1
+        valid.forecast_horizon = 1
+        valid.min_points = 2
+        valid.max_animals = 1
+        _validate_args(valid)
+
+        invalid_values = [
+            ("seed", -1, "--seed must be non-negative"),
+            ("lr", 0.0, "--lr must be a finite positive number"),
+            ("lr", -0.1, "--lr must be a finite positive number"),
+            ("lr", float("nan"), "--lr must be a finite positive number"),
+            ("lr", float("inf"), "--lr must be a finite positive number"),
+            ("lr", float("-inf"), "--lr must be a finite positive number"),
+            ("epochs", 0, "--epochs must be positive"),
+            ("batch_size", 0, "--batch-size must be positive"),
+            ("hidden_size", 0, "--hidden-size must be positive"),
+            ("num_layers", 0, "--num-layers must be positive"),
+            ("input_length", 0, "input_length must be at least 1"),
+            ("max_animals", 0, "max_animals must be positive or None"),
+            ("val_size", float("nan"), "val_size and test_size must be positive"),
+            ("dropout", -0.01, "--dropout must be finite and in \[0, 1\)"),
+            ("dropout", 1.0, "--dropout must be finite and in \[0, 1\)"),
+            ("dropout", float("nan"), "--dropout must be finite and in \[0, 1\)"),
+            ("dropout", float("inf"), "--dropout must be finite and in \[0, 1\)"),
+            ("num_workers", -1, "--num-workers cannot be negative"),
+        ]
+        for field, value, message in invalid_values:
+            with self.subTest(field=field, value=value):
+                args = build_parser().parse_args([])
+                setattr(args, field, value)
+                with self.assertRaisesRegex(ValueError, message):
+                    _validate_args(args)
+
+        for option, value, message in (("--seed", "-1", "--seed must be non-negative"),
+                                       ("--lr", "inf", "--lr must be a finite positive number")):
+            with self.subTest(cli_option=option), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    train_main(["--data-path", "unused.csv", option, value])
+                self.assertEqual(raised.exception.code, 2, message)
+
     def test_artifacts_round_trip_and_are_deterministic(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); csv = root / "gps.csv"; write_fixture(csv)
@@ -122,6 +173,8 @@ class PipelineInterfaceTests(unittest.TestCase):
                 ("data", "max_animals", 0, "data.max_animals"),
                 ("trajectory", "forecast_horizon", 0, "forecast_horizon"),
                 ("training", "batch_size", 0, "training.batch_size"),
+                ("training", "seed", -1, "training.seed"),
+                ("training", "learning_rate", float("inf"), "training.learning_rate"),
                 ("training", "dropout", 1, "training.dropout"),
                 ("training", "strict_determinism", "false", "training.strict_determinism"),
             ]

@@ -16,7 +16,8 @@ from src.data.data_prep import (TrajectoryConfig, build_trajectory_sequences,
                                 save_prepared_sequences)
 from src.data.validation import validate_dataset, write_quality_report
 from src.models.train import (build_parser as build_training_parser,
-                              normalize_local_tracking_uri, run_training)
+                              normalize_local_tracking_uri, run_training,
+                              validate_training_parameters)
 
 def _path(root: Path, value: str) -> Path:
     path = Path(value)
@@ -80,17 +81,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG) -> tuple[dict, Path]:
             _validate_split_sizes(traj["test_size"], traj["val_size"])
         except ValueError as exc:
             raise ValueError(f"trajectory.val_size and trajectory.test_size are invalid: {exc}") from exc
-        for key in ("seed", "batch_size", "epochs", "hidden_size", "num_layers", "num_workers"):
-            if type(training.get(key)) is not int:
-                raise ValueError(f"training.{key} must be an integer")
-        for key in ("epochs", "batch_size", "hidden_size", "num_layers"):
-            if training[key] < 1: raise ValueError(f"training.{key} must be positive")
-        if training["seed"] < 0: raise ValueError("training.seed must be non-negative")
-        if training["num_workers"] < 0: raise ValueError("training.num_workers cannot be negative")
-        if isinstance(training.get("learning_rate"), bool) or not isinstance(training.get("learning_rate"), (int, float)) or not math.isfinite(training["learning_rate"]) or training["learning_rate"] <= 0:
-            raise ValueError("training.learning_rate must be a positive number")
-        if isinstance(training.get("dropout"), bool) or not isinstance(training.get("dropout"), (int, float)) or not math.isfinite(training["dropout"]) or not 0 <= training["dropout"] < 1:
-            raise ValueError("training.dropout must be in [0, 1)")
+        validate_training_parameters(training)
         if type(training.get("strict_determinism")) is not bool:
             raise ValueError("training.strict_determinism must be a boolean")
         if training["data_kind"] not in ("unspecified", "real", "synthetic"):
