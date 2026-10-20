@@ -90,6 +90,22 @@ Observations are sorted and split chronologically per individual before windows 
 
 No real Movebank dataset is checked into this repository. Synthetic tests validate the implementation, but do not establish real-world model performance. Run validation and training on an identified real dataset before drawing performance conclusions. Results depend on sampling cadence and data quality; the current model consumes raw degree coordinates and does not model irregular time gaps.
 
+## Phase 7: model documentation and sensitivity analysis
+
+See the [model card](docs/model_card.md) for the verified model, preprocessing, split, and metric contracts, and [responsible-use guidance](docs/responsible_ml.md) for data governance and interpretation limits. The explanation helper perturbs one latitude or longitude value at one input timestep, then reports the Haversine displacement between the baseline and perturbed forecasts. It measures sensitivity to that chosen perturbation; it does not establish causality, forecast accuracy, or calibrated uncertainty. Inputs have no timestamps, so timestep indices do not represent a known duration.
+
+With a compatible checkpoint available, a synthetic demonstration can be run from the repository root:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.explainability.trajectory_sensitivity `
+  --checkpoint .\artifacts\pipeline\evaluation\trajectory_lstm.pt `
+  --trajectory-json '[[40.0,-3.0],[40.01,-2.99],[40.02,-2.98],[40.03,-2.97],[40.04,-2.96],[40.05,-2.95],[40.06,-2.94],[40.07,-2.93],[40.08,-2.92],[40.09,-2.91],[40.10,-2.90],[40.11,-2.89],[40.12,-2.88],[40.13,-2.87],[40.14,-2.86],[40.15,-2.85],[40.16,-2.84],[40.17,-2.83],[40.18,-2.82],[40.19,-2.81]]' `
+  --perturbation-degrees 0.01 `
+  --output .\artifacts\sensitivity\synthetic-example.json
+```
+
+The coordinates above are illustrative synthetic input, not Movebank observations. The JSON report includes baseline and perturbed forecasts, per-horizon forecast displacement in kilometres, skipped boundary perturbations, and the method's limitations. Forecast coordinates can be sensitive location information; store reports accordingly. The command requires a compatible checkpoint even for synthetic input. No canonical checkpoint or real-data explanation is currently available in this repository.
+
 ## Continuous integration
 
 GitHub Actions runs on pushes and pull requests targeting `main`. The Python job uses Ubuntu and Python 3.10, installs `requirements.txt`, compiles `src` and `tests`, runs Ruff 0.11.13, and executes the complete standard-library `unittest` suite. Ruff keeps its other default error checks while ignoring E402 (the direct-script `sys.path` bootstrap) and E701/E702 (the project's existing compact one-line style). The DVC and MLflow integration tests use disposable workspaces and local stores; CI does not require the Movebank CSV, a trained checkpoint, or hosted credentials. Ruff is pinned and installed only in CI, not added to the application's runtime requirements.
