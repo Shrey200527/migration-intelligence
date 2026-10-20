@@ -160,6 +160,69 @@ Check `http://localhost:8000/health` for process health and `/ready` for model r
 
 Serving exposes only local unauthenticated inference and has no request-rate limiting or model registry. Keep it on a trusted local network unless a separate security layer is designed. Real-data validation and model-quality claims remain pending until an identified Movebank dataset is evaluated.
 
+## Phase 6: monitoring and drift signals
+
+The serving process emits one-line JSON log records through Python's standard logging system for startup, request completion, inference failures, and model availability. Request records include endpoint, request type, batch size when known, HTTP status category, failure category, and duration in milliseconds. They never include request bodies, coordinates, credentials, filesystem paths, or exception tracebacks. Applications embedding the service can configure standard Python logging handlers; creating multiple app instances does not attach duplicate handlers.
+
+`GET /metrics` returns a process-local snapshot. It counts only `POST /predict` and `POST /predict/batch`; `/health`, `/ready`, `/metrics`, and unrelated routes are excluded. A request is successful for a 2xx/3xx response and failed for a 4xx/5xx response. Validation failures count responses with status 422. Request logs classify schema, coordinate type/bounds, non-finite coordinate, and sequence-length failures without retaining supplied values. `batch_size_distribution` counts sizes for requests that passed request-schema parsing; malformed bodies have unknown size and are omitted. Prediction counts and `sequence_length_distribution` include trajectories only when inference succeeds. `inference_latency_ms` measures the predictor call only, in milliseconds; its count can be lower than the request count when a request fails before inference starts. It is summarized as count, mean, and maximum. Counters and aggregates are protected by a lock. Metrics reset when the process restarts and are not shared across workers.
+
+Example response (counts and values depend on the process):
+
+```json
+{
+  "requests": {
+    "total": 12,
+    "succeeded": 10,
+    "failed": 2,
+    "by_endpoint": {
+      "/predict": {"requests": 8, "succeeded": 7, "failed": 1},
+      "/predict/batch": {"requests": 4, "succeeded": 3, "failed": 1}
+    },
+    "http_errors_by_status_class": {"4xx": 1, "5xx": 1},
+    "validation_failures": 1,
+    "batch_size_distribution": {"1": 8, "5": 4}
+  },
+  "predictions": {"count": 13, "invalid_output_trajectories": 0},
+  "input_summary": {
+    "sampled_trajectories": 13,
+    "sequence_length_distribution": {"4": 13}
+  },
+  "inference_latency_ms": {"count": 12, "mean": 8.4, "max": 24.1},
+  "model": {"ready": true},
+  "drift": {
+    "status": "baseline_unavailable",
+    "samples": 13,
+    "baseline_version": null,
+    "threshold": null,
+    "drifted_features": []
+  }
+}
+```
+
+After a successful forecast, the service retains only up to 256 per-trajectory scalar summaries: mean latitude, circular mean longitude, and mean consecutive-point Haversine distance in kilometres. It does not retain coordinate sequences or forecasts. The live-window longitude mean uses circular statistics over those per-trajectory longitude summaries, just as each per-trajectory summary uses a circular mean over its coordinates. Baseline longitude means must use the same two-step definition. Longitude differences use the shortest signed angular difference in [-180, 180), so +180 and -180 are equivalent. If the circular resultant magnitude is at most `1e-12`, the longitude mean is ambiguous: that sample is retained with an unavailable longitude feature, and the detector omits the longitude score. When enough samples exist but the live-window longitude is ambiguous, drift status is `ambiguous_data` unless another feature independently signals `drift_detected`; the response lists the ambiguous feature. This avoids reporting a misleading longitude score. Circular summaries still cannot describe multimodal populations or all geographic movement patterns. Invalid requests are counted by status/category but are not sampled for drift. Predicted outputs are already checked for shape, finiteness, and geographic bounds by the inference layer; the monitor also checks outputs without allowing monitoring failures to change a prediction response.
+
+There is no trusted real-data drift baseline in this repository. Without one, drift is reported as `baseline_unavailable`; this is not evidence of stable data. A user may provide an aggregate baseline at process startup using `DRIFT_BASELINE_PATH`, pointing to a JSON file with this form:
+
+```json
+{
+  "version": "baseline-2026-01",
+  "source": "document the dataset and aggregation used",
+  "z_threshold": 3.0,
+  "min_samples": 30,
+  "features": {
+    "mean_latitude": {"mean": 50.0, "std": 2.0},
+    "mean_longitude": {"mean": 10.0, "std": 5.0},
+    "mean_step_distance_km": {"mean": 1.2, "std": 0.4}
+  }
+}
+```
+
+These values only illustrate the schema; they are not a project baseline and must not be used as a real migration reference. The detector compares each feature's mean over the current bounded window with the configured baseline mean, using absolute standardized mean differences `abs(window_mean - baseline_mean) / baseline_std`; longitude means and differences use the circular definitions above. For each feature, `std` must be finite and at least `1e-12` in that feature's units; zero and smaller values are rejected. A feature signals drift when its score is strictly greater than `z_threshold`. At least `min_samples` successful trajectories are required (2–256); before then status is `insufficient_data`. The response reports `no_drift_detected`, `drift_detected`, or `ambiguous_data`, baseline version, sample count, threshold, scores, and feature names. This is a lightweight input-distribution alert, not a calibrated hypothesis test, and it says nothing about model quality. Baseline source/version and meaningful means and standard deviations calculated from the same per-trajectory summaries must be supplied by the operator. The baseline file is read at app creation; restart the service after changing it.
+
+Forecast-quality evaluation is deliberately separate from ordinary prediction. A prediction without future ground truth has quality status `unavailable` and is never assigned an accuracy score. The testable `src.monitoring.forecast_quality.evaluate_forecast_quality` utility accepts matching `(samples, horizon, 2)` prediction and ground-truth arrays, validates finite in-bounds coordinates, and returns sample count, ADE/FDE in kilometres, and optional threshold-breach status. ADE is the mean Haversine distance over all samples and forecast steps; FDE is the mean distance at the final forecast step. Thresholds are optional non-negative kilometre values. If no threshold is supplied, status is `evaluated` rather than a claim that quality is good. This interface is intended for a trusted evaluation path that actually has ground truth; the public inference API does not accept ground truth.
+
+Run monitoring and serving tests with `python -m unittest tests.test_monitoring tests.test_serving -v`, then run the full suite with `python -m unittest discover -s tests -v`. The tests use synthetic coordinates and temporary checkpoints; they do not establish real-data drift or forecast quality. No monitoring dependency or external service is required.
+
 ## Reproducible pipeline interfaces
 
 `configs/pipeline.json` is the shared pipeline configuration. Relative data and output paths are resolved from the repository root, independent of the shell's current directory. Defaults preserve Phase 1 model and split settings; the shared animal limit is 10, matching the training CLI. Edit this JSON or pass stage-specific path overrides. Supported settings are:

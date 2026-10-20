@@ -17,6 +17,10 @@ class InferenceError(ValueError):
     """The requested trajectory or the loaded model cannot be used for inference."""
 
 
+class InvalidForecastError(RuntimeError):
+    """The model produced a malformed, non-finite, or out-of-bounds forecast."""
+
+
 def default_checkpoint_path() -> Path:
     """Return the repository's canonical trained-checkpoint location."""
     configured = os.environ.get("MODEL_CHECKPOINT")
@@ -109,13 +113,13 @@ class TrajectoryPredictor:
             predictions = self.model(inputs)
         expected_shape = (len(sequences), self.forecast_horizon, 2)
         if tuple(predictions.shape) != expected_shape:
-            raise RuntimeError("Loaded model returned an incompatible forecast shape.")
+            raise InvalidForecastError("Loaded model returned an incompatible forecast shape.")
         output = predictions.detach().cpu().numpy()
         if not np.isfinite(output).all():
-            raise RuntimeError("Loaded model returned non-finite forecast coordinates.")
+            raise InvalidForecastError("Loaded model returned non-finite forecast coordinates.")
         if (np.any((output[:, :, 0] < -90) | (output[:, :, 0] > 90))
                 or np.any((output[:, :, 1] < -180) | (output[:, :, 1] > 180))):
-            raise RuntimeError("Loaded model returned coordinates outside valid latitude/longitude bounds.")
+            raise InvalidForecastError("Loaded model returned coordinates outside valid latitude/longitude bounds.")
         return output.astype(float).tolist()
 
     def predict(self, sequence: Iterable[Iterable[float]]) -> list[list[float]]:
