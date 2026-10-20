@@ -90,6 +90,58 @@ Observations are sorted and split chronologically per individual before windows 
 
 No real Movebank dataset is checked into this repository. Synthetic tests validate the implementation, but do not establish real-world model performance. Run validation and training on an identified real dataset before drawing performance conclusions. Results depend on sampling cadence and data quality; the current model consumes raw degree coordinates and does not model irregular time gaps.
 
+## Phase 4: local model serving
+
+The serving layer reuses `src.models.model.TrajectoryLSTM` and the checkpoint written by training. Checkpoints contain the model state plus `model_cfg` and `traj_cfg`; the loader reads them with PyTorch's `weights_only=True`, checks that the architecture and trajectory horizon agree, and never trains a model during service startup. The original CSV is not needed after a compatible checkpoint has been produced.
+
+Inputs are the same raw coordinates used during training: exactly `input_length` pairs in `[latitude, longitude]` order, in degrees, with latitude in `[-90, 90]` and longitude in `[-180, 180]`. The response contains `forecast_horizon` pairs in the same order and units. Inputs are not normalized and predictions are not clamped. If a prediction is non-finite or outside geographic bounds, the service returns a generic server error rather than publishing invalid coordinates.
+
+### Start locally
+
+Install the project requirements (which include FastAPI and Uvicorn) in the existing Python 3.10 environment. Train the model using the documented pipeline or standalone CLI. The default checkpoint is `artifacts/pipeline/evaluation/trajectory_lstm.pt`; override it with `MODEL_CHECKPOINT` when serving another trained checkpoint:
+
+```powershell
+$env:MODEL_CHECKPOINT = "artifacts/pipeline/evaluation/trajectory_lstm.pt"
+& .\.venv\Scripts\python.exe -m uvicorn src.serving.api:app --host 127.0.0.1 --port 8000
+```
+
+The app attempts to load the checkpoint once when the process starts. If it is missing or incompatible, the process still serves `/health`, while `/ready` and prediction endpoints return HTTP 503. Configure the path and restart after correcting the checkpoint. The response does not expose filesystem paths or checkpoint-loading details.
+
+### HTTP API
+
+- `GET /health` means the HTTP process is responding; it does not indicate that a model is loaded.
+- `GET /ready` returns `200` only when the checkpoint loaded successfully, otherwise `503`.
+- `POST /predict` accepts `{"trajectory": [[lat, lon], ...]}` and returns `{"forecast": [[lat, lon], ...], "coordinate_order": "latitude,longitude", "coordinate_units": "degrees"}`.
+- `POST /predict/batch` accepts `{"trajectories": [[[lat, lon], ...], ...]}`. A batch contains 1 to 64 trajectories. If any item is invalid, the entire request is rejected with HTTP 422; inference is not partially returned.
+
+Each trajectory is bounded to 512 coordinate pairs at schema validation and then must match the checkpoint's exact input length. Malformed coordinates and out-of-range inputs return HTTP 422. Unexpected model failures return HTTP 500 without a traceback. Interactive OpenAPI docs are available at `/docs`.
+
+Example request:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/predict `
+  -H "Content-Type: application/json" `
+  -d '{"trajectory":[[37.0,-122.0],[37.1,-121.9],[37.2,-121.8],[37.3,-121.7]]}'
+```
+
+The example contains four points and only matches a checkpoint with `input_length=4`; substitute the checkpoint's configured length. Run focused API tests with `.\.venv\Scripts\python.exe -m unittest tests.test_serving -v`. The tests use a deterministic temporary checkpoint and do not report model-quality results.
+
+### Docker
+
+The image installs the dependencies in `requirements.txt`, runs as a non-root user, and excludes local datasets, checkpoints, DVC state, MLflow stores, and development artifacts from the build context. Supply a trained checkpoint as a read-only mount; the image does not contain a model:
+
+```powershell
+docker build -t migration-intelligence-api .
+docker run --rm -p 8000:8000 `
+  -e MODEL_CHECKPOINT=/models/trajectory_lstm.pt `
+  --mount "type=bind,source=$((Resolve-Path .\artifacts\pipeline\evaluation\trajectory_lstm.pt).Path),target=/models/trajectory_lstm.pt,readonly" `
+  migration-intelligence-api
+```
+
+Check `http://localhost:8000/health` for process health and `/ready` for model readiness, then send the sample request above. Stop the foreground container with Ctrl+C. Docker's health check follows `/ready`, so a container without a valid mounted checkpoint is marked unhealthy. Build and runtime support depend on Docker being installed locally; ordinary Python tests do not require Docker.
+
+Serving exposes only local unauthenticated inference and has no request-rate limiting or model registry. Keep it on a trusted local network unless a separate security layer is designed. Real-data validation and model-quality claims remain pending until an identified Movebank dataset is evaluated.
+
 ## Reproducible pipeline interfaces
 
 `configs/pipeline.json` is the shared pipeline configuration. Relative data and output paths are resolved from the repository root, independent of the shell's current directory. Defaults preserve Phase 1 model and split settings; the shared animal limit is 10, matching the training CLI. Edit this JSON or pass stage-specific path overrides. Supported settings are:
