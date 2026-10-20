@@ -3,13 +3,13 @@
   "stages": {
     "validate": {
       "cmd": "python src/pipeline.py validate --config configs/pipeline.json",
-      "deps": ["${data.raw_path}", "src/pipeline.py", "src/data/validation.py", "src/data/data_prep.py", "requirements.txt"],
+      "deps": ["${data.raw_path}", "src/pipeline.py", "src/data/validation.py", "src/data/data_prep.py", "src/models/train.py", "requirements.txt"],
       "params": [{"configs/pipeline.json": ["data.raw_path", "data.max_animals", "data.validation_report", "data.validation_summary", "trajectory.input_length", "trajectory.forecast_horizon", "trajectory.min_points_per_track", "trajectory.val_size", "trajectory.test_size"]}],
       "outs": ["${data.validation_report}", "${data.validation_summary}"]
     },
     "prepare": {
       "cmd": "python src/pipeline.py prepare --config configs/pipeline.json",
-      "deps": ["${data.raw_path}", "${data.validation_report}", "src/pipeline.py", "src/data/validation.py", "src/data/data_prep.py", "requirements.txt"],
+      "deps": ["${data.raw_path}", "${data.validation_report}", "src/pipeline.py", "src/data/validation.py", "src/data/data_prep.py", "src/models/train.py", "requirements.txt"],
       "params": [{"configs/pipeline.json": ["data.raw_path", "data.max_animals", "data.validation_report", "data.prepared_dir", "trajectory.input_length", "trajectory.forecast_horizon", "trajectory.min_points_per_track", "trajectory.val_size", "trajectory.test_size", "training.seed"]}],
       "outs": ["${data.prepared_dir}"]
     },

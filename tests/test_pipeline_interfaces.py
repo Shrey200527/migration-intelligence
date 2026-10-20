@@ -15,6 +15,7 @@ import pandas as pd
 from src.data.data_prep import (TrajectoryConfig, build_trajectory_sequences,
                                 load_prepared_sequences, save_prepared_sequences)
 from src.pipeline import load_config, main as pipeline_main
+from src.data.validation import validate_dataset
 from src.models.train import (_validate_args, build_parser, main as train_main,
                               run_training)
 
@@ -27,6 +28,13 @@ def write_fixture(path: Path, observations: int = 120) -> None:
                          "individual-local-identifier": animal, "location-long": 10 + i * .01,
                          "location-lat": 40 + i * .01})
     pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _save_fixture(output: Path, csv: Path, cfg: TrajectoryConfig, splits=None):
+    splits = splits or build_trajectory_sequences(str(csv), cfg, .15, .15)
+    report = validate_dataset(csv, cfg, val_size=.15, test_size=.15, max_animals=cfg.max_animals)
+    return save_prepared_sequences(output, splits, cfg, .15, .15,
+                                   source_csv=csv, quality_report=report)
 
 
 class PipelineInterfaceTests(unittest.TestCase):
@@ -86,14 +94,16 @@ class PipelineInterfaceTests(unittest.TestCase):
             cfg = TrajectoryConfig(3, 2, 5, 2)
             splits = build_trajectory_sequences(str(csv), cfg, .15, .15)
             first = root / "prepared1"; second = root / "prepared2"
-            manifest = save_prepared_sequences(first, splits, cfg, .15, .15)
-            save_prepared_sequences(second, splits, cfg, .15, .15)
+            manifest = _save_fixture(first, csv, cfg, splits)
+            _save_fixture(second, csv, cfg, splits)
             self.assertEqual(manifest["splits"]["train"]["feature_order"], ["latitude", "longitude"])
             for name in ("train.npz", "validation.npz", "test.npz", "manifest.json"):
                 self.assertEqual((first / name).read_bytes(), (second / name).read_bytes())
             loaded, loaded_manifest = load_prepared_sequences(first, cfg)
             self.assertEqual([len(part) for part in loaded], [len(part) for part in splits])
-            self.assertEqual(loaded_manifest["format_version"], 1)
+            self.assertEqual(loaded_manifest["format_version"], 2)
+            self.assertEqual(loaded_manifest["source_fingerprint"]["algorithm"], "sha256")
+            self.assertEqual(set(loaded_manifest["split_files"]), {"train", "validation", "test"})
             self.assertEqual(loaded[0][0][0].dtype, np.float32)
             self.assertNotIn('"A"', json.dumps(loaded_manifest))
             self.assertLess(max(seq[1][-1, 0] for seq in loaded[0]), min(seq[0][0, 0] for seq in loaded[1]))
@@ -107,32 +117,73 @@ class PipelineInterfaceTests(unittest.TestCase):
             csv = root / "gps.csv"; write_fixture(csv)
             cfg = TrajectoryConfig(3, 2, 5, 2)
             output = root / "prepared"
-            save_prepared_sequences(output, build_trajectory_sequences(str(csv), cfg), cfg, .15, .15)
+            _save_fixture(output, csv, cfg)
             (output / "test.npz").unlink()
             with self.assertRaisesRegex(ValueError, "test artifact"):
                 load_prepared_sequences(output)
-            save_prepared_sequences(output, build_trajectory_sequences(str(csv), cfg), cfg, .15, .15)
+            _save_fixture(output, csv, cfg)
             manifest_path = output / "manifest.json"
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest["splits"]["train"]["sequence_count"] += 1
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "manifest metadata"):
                 load_prepared_sequences(output)
-            save_prepared_sequences(output, build_trajectory_sequences(str(csv), cfg), cfg, .15, .15)
+            _save_fixture(output, csv, cfg)
             archive_path = output / "validation.npz"
             archive_path.write_bytes(archive_path.read_bytes()[:48])
             with self.assertRaisesRegex(ValueError, "Invalid prepared data"):
                 load_prepared_sequences(output)
-            save_prepared_sequences(output, build_trajectory_sequences(str(csv), cfg), cfg, .15, .15)
+            _save_fixture(output, csv, cfg)
             with self.assertRaisesRegex(ValueError, "test_size"):
                 load_prepared_sequences(output, cfg, expected_test_size=.2, expected_val_size=.15)
+
+    def test_loader_rejects_source_and_split_integrity_mismatches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); csv = root / "gps.csv"; write_fixture(csv)
+            cfg = TrajectoryConfig(3, 2, 5, 2); output = root / "prepared"
+            _save_fixture(output, csv, cfg)
+            manifest_path = output / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            original_fingerprint = manifest["source_fingerprint"].copy()
+            manifest["source_fingerprint"]["digest"] = "0" * 64
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "source fingerprint does not match"):
+                load_prepared_sequences(output, expected_source_fingerprint=original_fingerprint)
+            _save_fixture(output, csv, cfg)
+            with (output / "train.npz").open("ab") as stream:
+                stream.write(b"tampered")
+            with self.assertRaisesRegex(ValueError, "checksum or size"):
+                load_prepared_sequences(output)
+
+    def test_failed_prepared_generation_publication_preserves_previous_generation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); csv = root / "gps.csv"; write_fixture(csv)
+            cfg = TrajectoryConfig(3, 2, 5, 2); output = root / "prepared"
+            old_manifest = _save_fixture(output, csv, cfg)
+            old_bytes = (output / "train.npz").read_bytes()
+            report = validate_dataset(csv, cfg, val_size=.15, test_size=.15, max_animals=2)
+            original_replace = __import__("os").replace
+
+            def fail_candidate_publish(path, target):
+                if ".candidate-" in Path(path).name and Path(target) == output:
+                    raise OSError("simulated publication failure")
+                return original_replace(path, target)
+
+            with patch("src.data.data_prep.os.replace", side_effect=fail_candidate_publish):
+                with self.assertRaisesRegex(OSError, "simulated publication failure"):
+                    save_prepared_sequences(output, build_trajectory_sequences(str(csv), cfg), cfg,
+                                            .15, .15, source_csv=csv, quality_report=report)
+            loaded, manifest = load_prepared_sequences(output, cfg)
+            self.assertEqual(manifest, old_manifest)
+            self.assertEqual((output / "train.npz").read_bytes(), old_bytes)
+            self.assertEqual(len(loaded[0]), old_manifest["splits"]["train"]["sequence_count"])
 
     def test_training_uses_prepared_arrays_after_raw_data_is_removed(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); csv = root / "gps.csv"; write_fixture(csv)
             cfg = TrajectoryConfig(3, 2, 5, 2)
             prepared = root / "prepared"
-            save_prepared_sequences(prepared, build_trajectory_sequences(str(csv), cfg), cfg, .15, .15)
+            _save_fixture(prepared, csv, cfg)
             csv.unlink()
             args = build_parser().parse_args(["--prepared-dir", str(prepared), "--input-length", "3",
                 "--forecast-horizon", "2", "--min-points", "5", "--max-animals", "2",
@@ -155,6 +206,43 @@ class PipelineInterfaceTests(unittest.TestCase):
             self.assertEqual(first_checkpoint, (result / "trajectory_lstm.pt").read_bytes())
             self.assertEqual(first_summary, (result / "experiment_summary.json").read_bytes())
             self.assertEqual(first_report, (result / "experiment_report.md").read_bytes())
+
+    def test_failed_training_after_checkpoint_does_not_publish_canonical_success(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); csv = root / "gps.csv"; write_fixture(csv)
+            cfg = TrajectoryConfig(3, 2, 5, 2); prepared = root / "prepared"
+            _save_fixture(prepared, csv, cfg)
+            canonical = root / "evaluation"; canonical.mkdir()
+            (canonical / "old-success.txt").write_text("previous generation", encoding="utf-8")
+            args = build_parser().parse_args(["--prepared-dir", str(prepared), "--input-length", "3",
+                "--forecast-horizon", "2", "--min-points", "5", "--max-animals", "2",
+                "--batch-size", "8", "--epochs", "1", "--hidden-size", "4", "--num-layers", "1",
+                "--dropout", "0", "--device", "cpu", "--canonical-output", str(canonical)])
+            with patch("src.models.train._load_mlflow", return_value=None), \
+                    patch("src.models.train._evaluate_distances", side_effect=RuntimeError("evaluation failed")):
+                with self.assertRaisesRegex(RuntimeError, "evaluation failed"):
+                    run_training(args)
+            self.assertFalse(canonical.exists())
+            backups = list(root.glob(".evaluation.previous-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertTrue((backups[0] / "old-success.txt").is_file())
+
+    def test_malformed_quality_report_fails_before_training(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); csv = root / "gps.csv"; write_fixture(csv)
+            cfg = TrajectoryConfig(3, 2, 5, 2); prepared = root / "prepared"
+            _save_fixture(prepared, csv, cfg)
+            (prepared / "dataset_quality.json").write_text('{"usable": true}', encoding="utf-8")
+            args = build_parser().parse_args(["--prepared-dir", str(prepared), "--input-length", "3",
+                "--forecast-horizon", "2", "--min-points", "5", "--max-animals", "2",
+                "--batch-size", "8", "--epochs", "1", "--hidden-size", "4", "--num-layers", "1",
+                "--dropout", "0", "--device", "cpu", "--canonical-output", str(root / "evaluation")])
+            with patch("src.models.train._load_mlflow", return_value=None), \
+                    patch("src.models.train.train_one_epoch") as train_epoch:
+                with self.assertRaisesRegex(ValueError, "dataset_quality.json"):
+                    run_training(args)
+            train_epoch.assert_not_called()
+            self.assertFalse((root / "evaluation").exists())
 
     def test_config_validation_and_missing_input_entrypoint(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -194,7 +282,7 @@ class PipelineInterfaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); csv = root / "gps.csv"; write_fixture(csv)
             cfg = TrajectoryConfig(3, 2, 5, 2); prepared = root / "prepared"
-            save_prepared_sequences(prepared, build_trajectory_sequences(str(csv), cfg), cfg, .15, .15)
+            _save_fixture(prepared, csv, cfg)
             config = json.loads((Path(__file__).resolve().parents[1] / "configs" / "pipeline.json").read_text())
             config["data"].update({"raw_path": str(root / "missing.csv"), "max_animals": 2,
                                    "prepared_dir": str(prepared)})
@@ -249,6 +337,37 @@ class PipelineInterfaceTests(unittest.TestCase):
                 self.assertEqual(pipeline_main(["prepare", "--config", str(path)]), 2)
             self.assertIn("stale", error.getvalue())
             self.assertFalse((root / "prepared" / "manifest.json").exists())
+
+    def test_prepare_rejects_csv_changed_during_sequence_construction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); csv = root / "gps.csv"; write_fixture(csv)
+            config = json.loads((Path(__file__).resolve().parents[1] / "configs" / "pipeline.json").read_text())
+            config["data"].update({"raw_path": str(csv), "max_animals": 2,
+                "validation_report": str(root / "quality.json"),
+                "validation_summary": str(root / "quality.md"),
+                "prepared_dir": str(root / "prepared")})
+            config["trajectory"].update({"input_length": 3, "forecast_horizon": 2,
+                "min_points_per_track": 5, "val_size": .15, "test_size": .15})
+            config_path = root / "pipeline.json"
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+            self.assertEqual(pipeline_main(["validate", "--config", str(config_path)]), 0)
+            self.assertEqual(pipeline_main(["prepare", "--config", str(config_path)]), 0)
+            manifest_path = root / "prepared" / "manifest.json"
+            previous = manifest_path.read_bytes()
+            from src.data.data_prep import build_trajectory_sequences
+
+            def build_then_change(*args, **kwargs):
+                sequences = build_trajectory_sequences(*args, **kwargs)
+                with csv.open("a", encoding="utf-8") as stream:
+                    stream.write("2025-01-06T00:00:00,A,12.5,42.5\n")
+                return sequences
+
+            error = io.StringIO()
+            with patch("src.pipeline.build_trajectory_sequences", side_effect=build_then_change), \
+                    redirect_stderr(error):
+                self.assertEqual(pipeline_main(["prepare", "--config", str(config_path)]), 2)
+            self.assertIn("changed while preparation was running", error.getvalue())
+            self.assertEqual(manifest_path.read_bytes(), previous)
 
     def test_legacy_raw_csv_training_cli_still_runs(self):
         with tempfile.TemporaryDirectory() as temp:

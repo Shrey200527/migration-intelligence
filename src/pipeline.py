@@ -165,9 +165,13 @@ def main(argv: list[str] | None = None) -> int:
             sequences = build_trajectory_sequences(str(data_path), cfg,
                                                    test_size=traj["test_size"], val_size=traj["val_size"],
                                                    random_state=training["seed"])
+            current_fingerprint = {"algorithm": "sha256", "digest": _sha256_file(data_path)}
+            if current_fingerprint != report.get("source_fingerprint"):
+                raise ValueError("Raw CSV changed while preparation was running; rerun validate and prepare")
             manifest = save_prepared_sequences(output, sequences, cfg, traj["test_size"],
-                                               traj["val_size"], training["seed"])
-            write_quality_report(report, output / "dataset_quality.json", output / "dataset_quality.md")
+                                               traj["val_size"], training["seed"],
+                                               source_fingerprint=current_fingerprint,
+                                               quality_report=report)
             print(json.dumps(manifest, indent=2, sort_keys=True))
             return 0
         prepared_dir = _path(root, args.prepared_dir or data["prepared_dir"])

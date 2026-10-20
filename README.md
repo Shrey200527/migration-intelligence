@@ -50,6 +50,32 @@ The CLI retains options such as `--input-length`, `--forecast-horizon`, `--epoch
 
 Training seeds Python, NumPy, and PyTorch and supplies an explicit seed to the shuffled training sampler. It temporarily enables PyTorch deterministic algorithms in warning mode by default and restores prior backend settings after training. `--strict-determinism` makes unsupported nondeterministic operations fail. These settings improve repeatability for supported operations on the same software/hardware setup; they do not promise bit-for-bit agreement across devices, library versions, or platforms.
 
+Prepared-data manifest version 2 records the source CSV SHA-256 digest and each split archive's SHA-256 digest and byte size, without GPS rows or animal identifiers. Loading verifies checksums, shapes, dtypes, coordinate bounds, counts, and configuration. Older manifests without integrity metadata are rejected; rerun validation and preparation to regenerate them. Preparation builds and validates a complete candidate directory before publishing it by directory rename. The previous generation is retained as a hidden sibling for manual recovery; failed publication rolls back without mixing generations.
+
+Canonical training validates `dataset_quality.json` before training and writes to a unique sibling candidate directory. It publishes canonical results only after evaluation, report validation, and MLflow logging succeed. At the start of an attempted canonical run, an existing result directory is moved to a hidden `.previous-*` sibling; if training, evaluation, MLflow logging, or publication fails, the canonical path remains absent rather than showing stale results as the latest run. The legacy standalone output remains a unique per-run directory.
+
+### Programmatic prepared-data generation
+
+`save_prepared_sequences(output_dir, splits, cfg, test_size, val_size, random_state=42, *, source_csv=None, source_fingerprint=None, quality_report=None)` requires either `source_csv` or a `source_fingerprint` dictionary containing `{"algorithm": "sha256", "digest": "<64 lowercase hex characters>"}`. A source fingerprint is mandatory and is written into the manifest. For prepared data that will be used by training, also pass an aggregate `quality_report` produced by `validate_dataset` with the same CSV, trajectory configuration, and split settings. That report must be usable and include the required aggregate counts and selection fields; training rejects a prepared directory that lacks a valid `dataset_quality.json`.
+
+Migrate callers of the former positional form `save_prepared_sequences(out, splits, cfg, test_size, val_size, random_state)` by adding the source and report keywords:
+
+```python
+from src.data.data_prep import save_prepared_sequences
+from src.data.validation import validate_dataset
+
+quality = validate_dataset(
+    csv_path, cfg, val_size=val_size, test_size=test_size,
+    max_animals=cfg.max_animals,
+)
+save_prepared_sequences(
+    out, splits, cfg, test_size, val_size, random_state,
+    source_csv=csv_path, quality_report=quality,
+)
+```
+
+If the CSV is not available, supply a previously verified SHA-256 `source_fingerprint` instead. The prior positional arguments remain in the same order; callers must add one of these provenance keywords.
+
 ## Metrics and split policy
 
 - **MSE in degrees squared** is coordinate-space mean squared error over latitude/longitude outputs. It is not a geographic distance.

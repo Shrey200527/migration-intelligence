@@ -14,6 +14,7 @@ from src.data.data_prep import TrajectoryConfig, build_trajectory_sequences, sav
 from src.models.train import (build_parser, run_training, normalize_local_tracking_uri,
                               local_mlflow_artifact_uri)
 from src.pipeline import main as pipeline_main
+from src.data.validation import validate_dataset
 
 
 def _write_fixture(path: Path) -> None:
@@ -147,7 +148,9 @@ assert Path(downloaded).read_text(encoding="utf-8") == "native artifact payload"
             prepared = root / "prepared"
             config = TrajectoryConfig(3, 2, 5, 2)
             sequences = build_trajectory_sequences(str(csv), config, test_size=.15, val_size=.15)
-            save_prepared_sequences(prepared, sequences, config, .15, .15, random_state=17)
+            save_prepared_sequences(prepared, sequences, config, .15, .15, random_state=17,
+                                    source_csv=csv, quality_report=validate_dataset(
+                                        csv, config, val_size=.15, test_size=.15, max_animals=config.max_animals))
             database = root / "tracking" / "mlflow.db"
             database.parent.mkdir()
             tracking_uri = normalize_local_tracking_uri(str(database))
@@ -248,7 +251,9 @@ assert runs[0].data.params["seed"] == "17"
             cfg = TrajectoryConfig(3, 2, 5, 2)
             prepared = root / "prepared"
             sequences = build_trajectory_sequences(str(csv), cfg, test_size=.15, val_size=.15)
-            save_prepared_sequences(prepared, sequences, cfg, .15, .15, random_state=17)
+            save_prepared_sequences(prepared, sequences, cfg, .15, .15, random_state=17,
+                                    source_csv=csv, quality_report=validate_dataset(
+                                        csv, cfg, val_size=.15, test_size=.15, max_animals=cfg.max_animals))
             fake = _FakeMLflow()
             args = build_parser().parse_args([
                 "--prepared-dir", str(prepared), "--input-length", "3", "--forecast-horizon", "2",

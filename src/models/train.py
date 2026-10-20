@@ -9,8 +9,10 @@ import math
 import os
 import platform
 import random
+import shutil
 import tempfile
 import time
+import uuid
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -25,7 +27,7 @@ import torch.optim as optim
 
 from src.data.data_prep import (TrajectoryConfig, TrajectoryDataset, _validate_config,
                                 _validate_split_sizes, build_trajectory_sequences,
-                                load_prepared_sequences)
+                                load_prepared_sequences, _validate_dataset_quality_report)
 from src.data.validation import validate_dataset, write_quality_report
 from src.models.baseline import persistence_forecast
 from src.models.model import build_model
@@ -356,9 +358,49 @@ def run_training(args: argparse.Namespace) -> Path:
     elif not args.data_path or not Path(args.data_path).is_file():
         raise FileNotFoundError(f"GPS dataset not found: {args.data_path}")
     set_seed(args.seed)
-    with _deterministic_training(strict=args.strict_determinism):
-        with _mlflow_run(args) as tracker:
-            return _run_training(args, tracker)
+    if not args.canonical_output:
+        with _deterministic_training(strict=args.strict_determinism):
+            with _mlflow_run(args) as tracker:
+                return _run_training(args, tracker)
+
+    canonical = Path(args.canonical_output).absolute()
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    backup = canonical.with_name(f".{canonical.name}.previous-{uuid.uuid4().hex}")
+    staging = Path(tempfile.mkdtemp(prefix=f".{canonical.name}.candidate-", dir=str(canonical.parent)))
+    try:
+        if canonical.exists():
+            canonical.rename(backup)
+        staged_args = argparse.Namespace(**vars(args))
+        staged_args.canonical_output = str(staging)
+        staged_args._published_canonical_output = str(canonical)
+        if not args.diagnostics_dir:
+            staged_args.diagnostics_dir = str(canonical.with_name(canonical.name + "_diagnostics"))
+        with _deterministic_training(strict=args.strict_determinism):
+            with _mlflow_run(staged_args) as tracker:
+                _run_training(staged_args, tracker)
+        _validate_training_generation(staging)
+        os.replace(staging, canonical)
+        return canonical
+    except Exception:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _validate_training_generation(path: Path) -> None:
+    required = ("trajectory_lstm.pt", "experiment_summary.json", "experiment_report.md")
+    missing = [name for name in required if not (path / name).is_file()]
+    if missing:
+        raise ValueError(f"Training result generation is incomplete; missing: {', '.join(missing)}")
+    try:
+        summary = json.loads((path / "experiment_summary.json").read_text(encoding="utf-8"))
+        if (not isinstance(summary, dict) or not isinstance(summary.get("test_metrics"), dict)
+                or "best_validation_loss_mse_degrees_squared" not in summary
+                or not summary["test_metrics"]):
+            raise ValueError("experiment summary lacks required validation or test metrics")
+        torch.load(path / "trajectory_lstm.pt", map_location="cpu", weights_only=True)
+    except (OSError, json.JSONDecodeError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(f"Training result generation is invalid: {exc}") from exc
 
 
 def _run_training(args: argparse.Namespace, tracker=None) -> Path:
@@ -369,10 +411,7 @@ def _run_training(args: argparse.Namespace, tracker=None) -> Path:
             args.prepared_dir, traj_cfg, expected_test_size=args.test_size,
             expected_val_size=args.val_size)
         quality_file = Path(args.prepared_dir) / "dataset_quality.json"
-        report = json.loads(quality_file.read_text(encoding="utf-8")) if quality_file.is_file() else {
-            "counts": {"rows": 0, "invalid_records": 0, "duplicate_records": 0},
-            "valid_observations": 0, "individual_count": 0, "tracks_below_minimum_for_splits": 0,
-            "selection": {"selected_individual_count": 0}, "prepared_manifest": manifest}
+        report = _validate_dataset_quality_report(quality_file)
         generator = torch.Generator().manual_seed(args.seed)
         train_loader = DataLoader(TrajectoryDataset(train), batch_size=args.batch_size, shuffle=True,
                                   num_workers=args.num_workers, generator=generator)
@@ -408,7 +447,8 @@ def _run_training(args: argparse.Namespace, tracker=None) -> Path:
     safe_settings["data_path"] = Path(args.data_path).name if args.data_path else None
     safe_settings["prepared_dir"] = Path(args.prepared_dir).name if args.prepared_dir else None
     safe_settings["out_dir"] = Path(args.out_dir).name
-    safe_settings["canonical_output"] = Path(args.canonical_output).name if args.canonical_output else None
+    canonical_name = getattr(args, "_published_canonical_output", args.canonical_output)
+    safe_settings["canonical_output"] = Path(canonical_name).name if canonical_name else None
     safe_settings["diagnostics_dir"] = Path(args.diagnostics_dir).name if args.diagnostics_dir else None
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
@@ -500,7 +540,12 @@ def _run_training(args: argparse.Namespace, tracker=None) -> Path:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train an LSTM trajectory forecaster and compare with persistence")
     parser.add_argument("--data-path"); parser.add_argument("--prepared-dir")
-    parser.add_argument("--canonical-output", help="Stable output directory for pipeline use; replaces files in that directory.")
+    parser.add_argument("--canonical-output", help=(
+        "Canonical pipeline output path. Results are built in a candidate directory and "
+        "published here only after training, evaluation, and result validation succeed "
+        "(and MLflow logging succeeds when enabled); any prior generation is moved to a "
+        "hidden sibling for recovery."
+    ))
     parser.add_argument("--diagnostics-dir", help="Separate directory for nondeterministic runtime timing diagnostics.")
     parser.add_argument("--input-length", type=int, default=20)
     parser.add_argument("--forecast-horizon", type=int, default=5); parser.add_argument("--min-points", type=int, default=50)

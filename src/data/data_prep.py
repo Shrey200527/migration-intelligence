@@ -2,9 +2,12 @@
 import argparse
 from dataclasses import asdict, dataclass
 import io
+import hashlib
 import json
 import os
+import shutil
 import tempfile
+import uuid
 import zipfile
 import zlib
 from pathlib import Path
@@ -92,33 +95,70 @@ def _validate_split_sizes(test_size: float, val_size: float) -> None:
         raise ValueError("val_size and test_size must be positive and sum to less than 1.")
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _publish_directory(candidate: Path, output: Path) -> None:
+    """Swap a complete generation into place, rolling back on publication errors."""
+    backup = output.with_name(f".{output.name}.previous-{uuid.uuid4().hex}")
+    moved_old = False
+    try:
+        if output.exists():
+            output.rename(backup)
+            moved_old = True
+        os.replace(candidate, output)
+    except Exception:
+        if moved_old and not output.exists() and backup.exists():
+            backup.rename(output)
+        raise
+    # Keep the prior generation as a hidden sibling for manual recovery.
+
+
 def save_prepared_sequences(output_dir: str | Path, splits, cfg: TrajectoryConfig,
-                            test_size: float, val_size: float, random_state: int = 42) -> dict:
-    """Persist window arrays without pickle and write a deterministic, aggregate-only manifest."""
+                            test_size: float, val_size: float, random_state: int = 42,
+                            *, source_csv: str | Path | None = None,
+                            source_fingerprint: dict | None = None,
+                            quality_report: dict | None = None) -> dict:
+    """Build, validate, then publish a complete prepared-data generation."""
     _validate_config(cfg)
     _validate_split_sizes(test_size, val_size)
     if len(splits) != 3:
         raise ValueError("splits must contain train, validation, and test sequences")
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
+    output = Path(output_dir).absolute()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if source_fingerprint is None and source_csv is not None:
+        source_fingerprint = {"algorithm": "sha256", "digest": _sha256_file(Path(source_csv))}
+    if (not isinstance(source_fingerprint, dict)
+            or source_fingerprint.get("algorithm") != "sha256"
+            or not isinstance(source_fingerprint.get("digest"), str)
+            or len(source_fingerprint["digest"]) != 64
+            or any(char not in "0123456789abcdef" for char in source_fingerprint["digest"])):
+        raise ValueError("A source_csv or valid SHA-256 source_fingerprint is required to prepare data.")
+    candidate = Path(tempfile.mkdtemp(prefix=f".{output.name}.candidate-", dir=str(output.parent)))
     names = ("train", "validation", "test")
     counts = {}
-    for name, sequences in zip(names, splits):
-        if not sequences:
-            raise ValueError(f"Prepared {name} split is empty.")
-        past = np.stack([pair[0] for pair in sequences]).astype(np.float32, copy=False)
-        future = np.stack([pair[1] for pair in sequences]).astype(np.float32, copy=False)
-        expected = ((len(sequences), cfg.input_length, 2), (len(sequences), cfg.forecast_horizon, 2))
-        if past.shape != expected[0] or future.shape != expected[1] or not np.isfinite(past).all() or not np.isfinite(future).all():
-            raise ValueError(f"Prepared {name} arrays have invalid shapes or non-finite coordinates.")
-        if (np.any((past[:, :, 0] < -90) | (past[:, :, 0] > 90))
-                or np.any((future[:, :, 0] < -90) | (future[:, :, 0] > 90))
-                or np.any((past[:, :, 1] < -180) | (past[:, :, 1] > 180))
-                or np.any((future[:, :, 1] < -180) | (future[:, :, 1] > 180))):
-            raise ValueError(f"Prepared {name} arrays contain out-of-range latitude or longitude.")
-        fd, temporary = tempfile.mkstemp(prefix=name + ".", suffix=".tmp", dir=str(output))
-        try:
-            with os.fdopen(fd, "wb") as stream:
+    try:
+        split_files = {}
+        for name, sequences in zip(names, splits):
+            if not sequences:
+                raise ValueError(f"Prepared {name} split is empty.")
+            past = np.stack([pair[0] for pair in sequences]).astype(np.float32, copy=False)
+            future = np.stack([pair[1] for pair in sequences]).astype(np.float32, copy=False)
+            expected = ((len(sequences), cfg.input_length, 2), (len(sequences), cfg.forecast_horizon, 2))
+            if past.shape != expected[0] or future.shape != expected[1] or not np.isfinite(past).all() or not np.isfinite(future).all():
+                raise ValueError(f"Prepared {name} arrays have invalid shapes or non-finite coordinates.")
+            if (np.any((past[:, :, 0] < -90) | (past[:, :, 0] > 90))
+                    or np.any((future[:, :, 0] < -90) | (future[:, :, 0] > 90))
+                    or np.any((past[:, :, 1] < -180) | (past[:, :, 1] > 180))
+                    or np.any((future[:, :, 1] < -180) | (future[:, :, 1] > 180))):
+                raise ValueError(f"Prepared {name} arrays contain out-of-range latitude or longitude.")
+            path = candidate / f"{name}.npz"
+            with path.open("wb") as stream:
                 with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
                     for array_name, array in (("past", past), ("future", future)):
                         buffer = io.BytesIO()
@@ -127,31 +167,54 @@ def save_prepared_sequences(output_dir: str | Path, splits, cfg: TrajectoryConfi
                         info.compress_type = zipfile.ZIP_DEFLATED
                         info.external_attr = 0o600 << 16
                         archive.writestr(info, buffer.getvalue())
-            os.replace(temporary, output / f"{name}.npz")
-        finally:
-            if os.path.exists(temporary): os.unlink(temporary)
-        counts[name] = {"sequence_count": len(sequences), "past_shape": list(past.shape),
-                        "future_shape": list(future.shape), "dtype": "float32",
-                        "feature_order": ["latitude", "longitude"]}
-    manifest = {"format_version": 1, "coordinate_order": ["latitude", "longitude"],
-                "coordinate_units": "degrees", "config": asdict(cfg),
-                "split": {"policy": "chronological per individual before window generation; windows never cross split boundaries",
-                          "val_size": val_size, "test_size": test_size, "random_state_unused": random_state},
-                "splits": counts}
-    manifest_path = output / "manifest.json"
-    fd, temporary = tempfile.mkstemp(prefix="manifest.", suffix=".tmp", dir=str(output))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            counts[name] = {"sequence_count": len(sequences), "past_shape": list(past.shape),
+                            "future_shape": list(future.shape), "dtype": "float32",
+                            "feature_order": ["latitude", "longitude"]}
+            split_files[name] = {"file": path.name, "sha256": _sha256_file(path), "size_bytes": path.stat().st_size}
+        manifest = {"format_version": 2, "coordinate_order": ["latitude", "longitude"],
+                    "coordinate_units": "degrees", "config": asdict(cfg),
+                    "source_fingerprint": source_fingerprint,
+                    "split": {"policy": "chronological per individual before window generation; windows never cross split boundaries",
+                              "val_size": val_size, "test_size": test_size, "random_state_unused": random_state},
+                    "splits": counts, "split_files": split_files}
+        with (candidate / "manifest.json").open("w", encoding="utf-8", newline="\n") as stream:
             json.dump(manifest, stream, indent=2, sort_keys=True, allow_nan=False); stream.write("\n")
-        os.replace(temporary, manifest_path)
+        if quality_report is not None:
+            from src.data.validation import write_quality_report
+            write_quality_report(quality_report, candidate / "dataset_quality.json", candidate / "dataset_quality.md")
+        load_prepared_sequences(candidate, cfg, expected_test_size=test_size, expected_val_size=val_size)
+        if quality_report is not None:
+            _validate_dataset_quality_report(candidate / "dataset_quality.json")
+        _publish_directory(candidate, output)
+        return manifest
     finally:
-        if os.path.exists(temporary): os.unlink(temporary)
-    return manifest
+        if candidate.exists(): shutil.rmtree(candidate, ignore_errors=True)
+
+
+def _validate_dataset_quality_report(path: Path) -> dict:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid dataset_quality.json at {path}: {exc}") from exc
+    required = ("usable", "counts", "selection", "valid_observations", "individual_count",
+                "tracks_below_minimum_for_splits")
+    if (not isinstance(report, dict) or any(key not in report for key in required)
+            or report.get("usable") is not True or not isinstance(report.get("counts"), dict)
+            or any(type(report["counts"].get(key)) is not int or report["counts"][key] < 0
+                   for key in ("rows", "invalid_records", "duplicate_records"))
+            or not isinstance(report.get("selection"), dict)
+            or type(report["selection"].get("selected_individual_count")) is not int
+            or report["selection"]["selected_individual_count"] < 0
+            or any(type(report.get(key)) is not int or report[key] < 0
+                   for key in ("valid_observations", "individual_count", "tracks_below_minimum_for_splits"))):
+        raise ValueError(f"Invalid dataset_quality.json at {path}: expected a usable aggregate quality report with counts, selection, and track fields.")
+    return report
 
 
 def load_prepared_sequences(input_dir: str | Path, expected_config: TrajectoryConfig | None = None,
                             expected_test_size: float | None = None,
-                            expected_val_size: float | None = None):
+                            expected_val_size: float | None = None,
+                            expected_source_fingerprint: dict | None = None):
     """Load and validate the safe NPZ/JSON prepared-data format (pickle disabled)."""
     source = Path(input_dir)
     manifest_path = source / "manifest.json"
@@ -159,7 +222,8 @@ def load_prepared_sequences(input_dir: str | Path, expected_config: TrajectoryCo
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(manifest, dict): raise ValueError("manifest root must be a JSON object")
-        if manifest.get("format_version") != 1: raise ValueError("unsupported format_version")
+        if manifest.get("format_version") != 2:
+            raise ValueError("unsupported prepared-data manifest version; regenerate with the current prepare stage")
         if not isinstance(manifest.get("config"), dict): raise ValueError("manifest config must be an object")
         if not isinstance(manifest.get("split"), dict): raise ValueError("manifest split metadata must be an object")
         if not isinstance(manifest.get("splits"), dict): raise ValueError("manifest splits metadata must be an object")
@@ -176,12 +240,27 @@ def load_prepared_sequences(input_dir: str | Path, expected_config: TrajectoryCo
             raise ValueError("unsupported coordinate order")
         if manifest.get("coordinate_units") != "degrees":
             raise ValueError("unsupported coordinate units")
+        split_files = manifest.get("split_files")
+        if not isinstance(split_files, dict) or set(split_files) != {"train", "validation", "test"}:
+            raise ValueError("manifest split_files must describe train, validation, and test artifacts")
+        fingerprint = manifest.get("source_fingerprint")
+        if (not isinstance(fingerprint, dict) or fingerprint.get("algorithm") != "sha256"
+                or not isinstance(fingerprint.get("digest"), str) or len(fingerprint["digest"]) != 64
+                or any(char not in "0123456789abcdef" for char in fingerprint["digest"])):
+            raise ValueError("manifest source_fingerprint must contain a SHA-256 digest; regenerate prepared data")
+        if expected_source_fingerprint is not None and fingerprint != expected_source_fingerprint:
+            raise ValueError("prepared-data source fingerprint does not match the expected source; regenerate prepared data")
         if manifest["split"].get("policy") != "chronological per individual before window generation; windows never cross split boundaries":
             raise ValueError("unsupported chronological split policy")
         result = []
         for name in ("train", "validation", "test"):
             path = source / f"{name}.npz"
             if not path.is_file(): raise FileNotFoundError(f"Prepared {name} artifact not found: {path}")
+            file_meta = split_files[name]
+            if (not isinstance(file_meta, dict) or file_meta.get("file") != path.name
+                    or file_meta.get("size_bytes") != path.stat().st_size
+                    or file_meta.get("sha256") != _sha256_file(path)):
+                raise ValueError(f"Prepared {name} artifact checksum or size does not match manifest; regenerate prepared data")
             if not zipfile.is_zipfile(path):
                 raise ValueError(f"Prepared {name} artifact is truncated or is not a valid NPZ archive")
             with zipfile.ZipFile(path) as archive_check:
