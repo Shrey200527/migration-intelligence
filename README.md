@@ -90,6 +90,24 @@ Observations are sorted and split chronologically per individual before windows 
 
 No real Movebank dataset is checked into this repository. Synthetic tests validate the implementation, but do not establish real-world model performance. Run validation and training on an identified real dataset before drawing performance conclusions. Results depend on sampling cadence and data quality; the current model consumes raw degree coordinates and does not model irregular time gaps.
 
+## Continuous integration
+
+GitHub Actions runs on pushes and pull requests targeting `main`. The Python job uses Ubuntu and Python 3.10, installs `requirements.txt`, compiles `src` and `tests`, runs Ruff 0.11.13, and executes the complete standard-library `unittest` suite. Ruff keeps its other default error checks while ignoring E402 (the direct-script `sys.path` bootstrap) and E701/E702 (the project's existing compact one-line style). The DVC and MLflow integration tests use disposable workspaces and local stores; CI does not require the Movebank CSV, a trained checkpoint, or hosted credentials. Ruff is pinned and installed only in CI, not added to the application's runtime requirements.
+
+A separate Docker job builds the image without datasets or checkpoints in the build context. It starts a temporary container without a checkpoint and verifies that `/health` returns HTTP 200 while `/ready` returns HTTP 503. It does not push an image or deploy the service. Docker is required only for that CI job and for local container verification.
+
+To reproduce the Python job from the repository root:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pip install ruff==0.11.13
+python -m compileall -q src tests
+python -m ruff check --ignore E402,E701,E702 src tests
+python -m unittest discover -s tests -v
+```
+
+To run the CI image build locally, use `docker build --tag migration-intelligence:ci .`. The GitHub Actions workflow additionally runs the no-checkpoint health/readiness smoke test. A passing CI run checks code and serving behavior with synthetic fixtures; it does not establish real-data model performance.
+
 ## Phase 4: local model serving
 
 The serving layer reuses `src.models.model.TrajectoryLSTM` and the checkpoint written by training. Checkpoints contain the model state plus `model_cfg` and `traj_cfg`; the loader reads them with PyTorch's `weights_only=True`, checks that the architecture and trajectory horizon agree, and never trains a model during service startup. The original CSV is not needed after a compatible checkpoint has been produced.

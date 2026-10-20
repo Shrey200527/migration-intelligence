@@ -48,7 +48,7 @@ class DvcStructureTests(unittest.TestCase):
             "requirements.txt"})
 
     def test_declared_outputs_match_canonical_configuration(self):
-        data, training = self.config["data"], self.config["training"]
+        training = self.config["training"]
         self.assertEqual(self.graph["stages"]["validate"]["outs"],
                          ["${data.validation_report}", "${data.validation_summary}"])
         self.assertEqual(self.graph["stages"]["prepare"]["outs"], ["${data.prepared_dir}"])

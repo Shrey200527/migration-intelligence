@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.10"
+
+      - name: Install project dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Install pinned CI linter
+        run: python -m pip install --disable-pip-version-check ruff==0.11.13
+
+      - name: Compile source and tests
+        run: python -m compileall -q src tests
+
+      - name: Lint source and tests
+        run: python -m ruff check --ignore E402,E701,E702 src tests
+
+      - name: Run full unittest suite
+        run: python -m unittest discover -s tests -v
+
+  docker:
+    name: Docker build and serving smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build image
+        env:
+          IMAGE_TAG: migration-intelligence:ci-${{ github.sha }}
+        run: docker build --tag "$IMAGE_TAG" .
+
+      - name: Start container without a model checkpoint
+        env:
+          IMAGE_TAG: migration-intelligence:ci-${{ github.sha }}
+        run: >-
+          docker run --detach --name migration-intelligence-ci
+          --publish 127.0.0.1:8000:8000
+          --env MODEL_CHECKPOINT=/models/trajectory_lstm.pt
+          "$IMAGE_TAG"
+
+      - name: Check health and readiness behavior
+        run: |
+          python - <<'PY'
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+
+          deadline = time.monotonic() + 90
+          while True:
+              try:
+                  with urllib.request.urlopen("http://127.0.0.1:8000/health", timeout=3) as response:
+                      assert response.status == 200
+                      assert json.load(response)["status"] == "ok"
+                  break
+              except (OSError, urllib.error.URLError):
+                  if time.monotonic() >= deadline:
+                      raise
+                  time.sleep(2)
+
+          try:
+              urllib.request.urlopen("http://127.0.0.1:8000/ready", timeout=3)
+          except urllib.error.HTTPError as error:
+              assert error.code == 503, error.code
+              assert json.load(error)["detail"] == "Prediction model is not ready."
+          else:
+              raise AssertionError("Readiness should return HTTP 503 without a checkpoint")
+
+          print("Health returned 200 and readiness returned 503 without a checkpoint.")
+          PY
+
+      - name: Remove smoke-test container
+        if: always()
+        run: docker rm --force migration-intelligence-ci || true
