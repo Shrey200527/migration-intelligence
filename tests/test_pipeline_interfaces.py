@@ -87,7 +87,8 @@ class PipelineInterfaceTests(unittest.TestCase):
                 "--forecast-horizon", "2", "--min-points", "5", "--max-animals", "2",
                 "--batch-size", "8", "--epochs", "1", "--hidden-size", "4", "--num-layers", "1",
                 "--dropout", "0", "--device", "cpu", "--canonical-output", str(root / "evaluation")])
-            result = run_training(args)
+            with patch("src.models.train._load_mlflow", return_value=None):
+                result = run_training(args)
             self.assertTrue((result / "trajectory_lstm.pt").is_file())
             summary = json.loads((result / "experiment_summary.json").read_text(encoding="utf-8"))
             self.assertIn("persistence_ade_km", summary["test_metrics"])
@@ -98,7 +99,8 @@ class PipelineInterfaceTests(unittest.TestCase):
             first_checkpoint = (result / "trajectory_lstm.pt").read_bytes()
             first_summary = (result / "experiment_summary.json").read_bytes()
             first_report = (result / "experiment_report.md").read_bytes()
-            run_training(args)
+            with patch("src.models.train._load_mlflow", return_value=None):
+                run_training(args)
             self.assertEqual(first_checkpoint, (result / "trajectory_lstm.pt").read_bytes())
             self.assertEqual(first_summary, (result / "experiment_summary.json").read_bytes())
             self.assertEqual(first_report, (result / "experiment_report.md").read_bytes())
@@ -149,7 +151,8 @@ class PipelineInterfaceTests(unittest.TestCase):
                                        "num_layers": 1, "dropout": 0,
                                        "evaluation_dir": str(root / "evaluation")})
             config_path = root / "config.json"; config_path.write_text(json.dumps(config), encoding="utf-8")
-            self.assertEqual(pipeline_main(["train", "--config", str(config_path)]), 0)
+            with patch("src.models.train._load_mlflow", return_value=None):
+                self.assertEqual(pipeline_main(["train", "--config", str(config_path)]), 0)
             self.assertTrue((root / "evaluation" / "experiment_summary.json").is_file())
 
     def test_prepare_reuses_matching_validation_stage_report(self):
@@ -197,7 +200,8 @@ class PipelineInterfaceTests(unittest.TestCase):
     def test_legacy_raw_csv_training_cli_still_runs(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); csv = root / "gps.csv"; write_fixture(csv)
-            code = train_main(["--data-path", str(csv), "--input-length", "3",
+            with patch("src.models.train._load_mlflow", return_value=None):
+                code = train_main(["--data-path", str(csv), "--input-length", "3",
                 "--forecast-horizon", "2", "--min-points", "5", "--max-animals", "2",
                 "--batch-size", "8", "--epochs", "1", "--hidden-size", "4", "--num-layers", "1",
                 "--dropout", "0", "--device", "cpu", "--out-dir", str(root / "runs"),

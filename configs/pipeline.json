@@ -27,5 +27,9 @@
     "strict_determinism": false,
     "evaluation_dir": "artifacts/pipeline/evaluation",
     "diagnostics_dir": "artifacts/pipeline/diagnostics"
+  },
+  "mlflow": {
+    "tracking_uri": "sqlite:///mlruns/mlflow.db",
+    "experiment_name": "migration-intelligence"
   }
 }

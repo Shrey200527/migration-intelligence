@@ -11,9 +11,11 @@ import platform
 import random
 import tempfile
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import numpy as np
 import torch
@@ -33,6 +35,115 @@ def set_seed(seed: int) -> None:
     """Seed Python, NumPy, and PyTorch without changing process-wide backend policy."""
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+
+def normalize_local_tracking_uri(value: str, base_dir: str | Path | None = None) -> str:
+    """Normalize a local SQLite URI/path and reject non-SQLite or hosted stores."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("MLflow tracking URI must be a non-empty local SQLite URI or database path")
+    value = value.strip()
+    if value.startswith("sqlite:///"):
+        parsed = urlparse(value)
+        if parsed.netloc or parsed.query or parsed.fragment:
+            raise ValueError("MLflow SQLite tracking URI must identify a local database path only")
+        raw_path = value[len("sqlite:///"):]
+        if not raw_path:
+            raise ValueError("MLflow SQLite tracking URI must include a database path")
+        path = Path(raw_path).expanduser()
+        if os.name == "nt" and len(raw_path) >= 3 and raw_path[1:3] == ":/":
+            path = Path(raw_path)
+    else:
+        if "://" in value:
+            raise ValueError("Only local SQLite MLflow tracking URIs are supported; hosted tracking is disabled")
+        path = Path(value).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = Path(base_dir) / path
+    return "sqlite:///" + path.resolve().as_posix()
+
+
+def local_mlflow_artifact_uri(tracking_uri: str) -> str:
+    """Use a local artifact directory beside the configured SQLite database."""
+    if not tracking_uri.startswith("sqlite:///"):
+        raise ValueError("MLflow tracking URI must use a local SQLite database")
+    raw_path = tracking_uri[len("sqlite:///"):]
+    database_path = Path(raw_path)
+    if os.name == "nt" and len(raw_path) >= 3 and raw_path[1:3] == ":/":
+        database_path = Path(raw_path)
+    return (database_path.resolve().parent / "artifacts").as_uri()
+
+
+def _local_experiment(mlflow, tracking_uri: str, experiment_name: str):
+    """Get or create an experiment with an explicit local artifact root."""
+    from mlflow.tracking import MlflowClient
+
+    client = MlflowClient(tracking_uri=tracking_uri)
+    experiment = client.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        client.create_experiment(
+            experiment_name,
+            artifact_location=local_mlflow_artifact_uri(tracking_uri),
+        )
+        experiment = client.get_experiment_by_name(experiment_name)
+    artifact_uri = urlparse(experiment.artifact_location) if experiment is not None else None
+    if (experiment is None or artifact_uri.scheme != "file"
+            or artifact_uri.netloc not in ("", "localhost")):
+        raise ValueError("MLflow experiment artifacts must use a local file store")
+    return experiment
+
+
+def _load_mlflow():
+    try:
+        import mlflow
+    except ImportError:
+        return None
+    return mlflow
+
+
+def _mlflow_params(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "seed": args.seed,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "learning_rate": args.lr,
+        "hidden_size": args.hidden_size,
+        "num_layers": args.num_layers,
+        "dropout": args.dropout,
+        "num_workers": args.num_workers,
+        "device": args.device,
+        "strict_determinism": args.strict_determinism,
+        "input_length": args.input_length,
+        "forecast_horizon": args.forecast_horizon,
+        "min_points_per_track": args.min_points,
+        "max_animals": args.max_animals,
+        "validation_fraction": args.val_size,
+        "test_fraction": args.test_size,
+        "data_kind_label": args.data_kind,
+        "input_mode": "prepared" if args.prepared_dir else "raw_csv",
+    }
+
+
+@contextmanager
+def _mlflow_run(args: argparse.Namespace):
+    """Start a distinct local MLflow run, or preserve legacy training if absent."""
+    mlflow = _load_mlflow()
+    if mlflow is None:
+        warnings.warn(
+            "MLflow is not installed; training will continue without experiment tracking. "
+            "Install the project requirements to record this execution.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        yield None
+        return
+    tracking_uri = normalize_local_tracking_uri(args.mlflow_tracking_uri)
+    mlflow.set_tracking_uri(tracking_uri)
+    experiment = _local_experiment(mlflow, tracking_uri, args.mlflow_experiment_name)
+    with mlflow.start_run(experiment_id=experiment.experiment_id,
+                          nested=mlflow.active_run() is not None):
+        mlflow.log_params(_mlflow_params(args))
+        mlflow.set_tags({"data_kind": args.data_kind,
+                         "input_mode": "prepared" if args.prepared_dir else "raw_csv"})
+        yield mlflow
 
 
 @contextmanager
@@ -193,6 +304,9 @@ def _validate_args(args: argparse.Namespace) -> None:
     if args.min_points < args.input_length + args.forecast_horizon:
         raise ValueError("--min-points must be at least input-length + forecast-horizon")
     if args.lr <= 0: raise ValueError("--lr must be positive")
+    if not args.mlflow_experiment_name.strip():
+        raise ValueError("--mlflow-experiment-name must be non-empty")
+    normalize_local_tracking_uri(args.mlflow_tracking_uri)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise ValueError(f"Requested device '{args.device}', but CUDA is unavailable; use --device cpu")
     try: torch.device(args.device)
@@ -207,10 +321,11 @@ def run_training(args: argparse.Namespace) -> Path:
         raise FileNotFoundError(f"GPS dataset not found: {args.data_path}")
     set_seed(args.seed)
     with _deterministic_training(strict=args.strict_determinism):
-        return _run_training(args)
+        with _mlflow_run(args) as tracker:
+            return _run_training(args, tracker)
 
 
-def _run_training(args: argparse.Namespace) -> Path:
+def _run_training(args: argparse.Namespace, tracker=None) -> Path:
     device = torch.device(args.device)
     traj_cfg = TrajectoryConfig(args.input_length, args.forecast_horizon, args.min_points, args.max_animals)
     if args.prepared_dir:
@@ -251,6 +366,9 @@ def _run_training(args: argparse.Namespace) -> Path:
     model.to(device); criterion = nn.MSELoss(); optimizer = optim.Adam(model.parameters(), lr=args.lr)
     best_val = float("inf"); history = []; started = time.perf_counter(); checkpoint_path = run_dir / "trajectory_lstm.pt"
     safe_settings = vars(args).copy()
+    # Tracking locations are local operational settings, not scientific run data.
+    safe_settings.pop("mlflow_tracking_uri", None)
+    safe_settings.pop("mlflow_experiment_name", None)
     safe_settings["data_path"] = Path(args.data_path).name if args.data_path else None
     safe_settings["prepared_dir"] = Path(args.prepared_dir).name if args.prepared_dir else None
     safe_settings["out_dir"] = Path(args.out_dir).name
@@ -264,6 +382,9 @@ def _run_training(args: argparse.Namespace) -> Path:
                  "validation_loss_mse_degrees_squared": val_loss,
                  "elapsed_seconds": time.perf_counter() - epoch_start}
         history.append(entry)
+        if tracker is not None:
+            tracker.log_metrics({"training_loss_mse_degrees_squared": train_loss,
+                                 "validation_loss_mse_degrees_squared": val_loss}, step=epoch)
         print(f"Epoch {epoch:03d} | train MSE degrees squared={train_loss:.6f} | validation MSE degrees squared={val_loss:.6f} | {entry['elapsed_seconds']:.2f}s", flush=True)
         if val_loss < best_val:
             best_val = val_loss
@@ -275,6 +396,8 @@ def _run_training(args: argparse.Namespace) -> Path:
             print(f"Saved best validation checkpoint: {checkpoint_path}", flush=True)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state"])
+    if tracker is not None:
+        tracker.log_params({f"model.{key}": value for key, value in model_cfg.__dict__.items()})
     test_mse = eval_epoch(model, test_loader, criterion, device)
     lstm_ade, lstm_fde = _evaluate_distances(model, test_loader, device)
     base_ade, base_fde = _evaluate_distances(lambda x: persistence_forecast(x, args.forecast_horizon), test_loader, device)
@@ -320,6 +443,18 @@ def _run_training(args: argparse.Namespace) -> Path:
           f"{m['fde_comparison']['percentage_improvement'] if m['fde_comparison']['percentage_improvement'] is not None else 'undefined (zero baseline)'}%.\n\n"
           "Limitations: the data-kind label is user-supplied and unverified. Evaluation uses strict chronological partitions; test inputs are entirely within the test period. Results describe this dataset and run only.\n")
     (run_dir / "experiment_report.md").write_text(md, encoding="utf-8")
+    if tracker is not None:
+        tracker.log_metrics({
+            "best_validation_loss_mse_degrees_squared": best_val,
+            "test_lstm_mse_degrees_squared": test_mse,
+            "test_lstm_ade_km": lstm_ade,
+            "test_lstm_fde_km": lstm_fde,
+            "test_persistence_ade_km": base_ade,
+            "test_persistence_fde_km": base_fde,
+        })
+        tracker.log_artifact(str(checkpoint_path), artifact_path="model")
+        tracker.log_artifact(str(run_dir / "experiment_summary.json"), artifact_path="evaluation")
+        tracker.log_artifact(str(run_dir / "experiment_report.md"), artifact_path="evaluation")
     print(f"Test LSTM MSE: {test_mse:.6f} degrees squared | ADE: {lstm_ade:.3f} km | FDE: {lstm_fde:.3f} km")
     print(f"Persistence ADE: {base_ade:.3f} km | FDE: {base_fde:.3f} km")
     print(f"Experiment artifacts: {run_dir}")
@@ -344,6 +479,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Label the input source in reports; this is not independently verified.")
     parser.add_argument("--strict-determinism", action="store_true",
                          help="Fail if PyTorch encounters an operation without deterministic support.")
+    default_mlflow_db = Path(__file__).resolve().parents[2] / "mlruns" / "mlflow.db"
+    parser.add_argument("--mlflow-tracking-uri", default=str(default_mlflow_db),
+                        help="Local SQLite tracking URI or database path (default: repository mlruns/mlflow.db).")
+    parser.add_argument("--mlflow-experiment-name", default="migration-intelligence",
+                        help="MLflow experiment name (default: migration-intelligence).")
     return parser
 
 

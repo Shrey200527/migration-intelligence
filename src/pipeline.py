@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT))
 from src.data.data_prep import (TrajectoryConfig, build_trajectory_sequences,
                                 save_prepared_sequences)
 from src.data.validation import validate_dataset, write_quality_report
-from src.models.train import build_parser as build_training_parser, run_training
+from src.models.train import (build_parser as build_training_parser,
+                              normalize_local_tracking_uri, run_training)
 
 def _path(root: Path, value: str) -> Path:
     path = Path(value)
@@ -41,9 +42,18 @@ def load_config(path: str | Path = DEFAULT_CONFIG) -> tuple[dict, Path]:
         raise ValueError(f"Could not read pipeline configuration {config_path}: {exc}") from exc
     try:
         if not isinstance(config, dict): raise ValueError("configuration root must be an object")
-        data, traj, training = config["data"], config["trajectory"], config["training"]
-        if not all(isinstance(section, dict) for section in (data, traj, training)):
-            raise ValueError("data, trajectory, and training sections must be objects")
+        data, traj, training, mlflow = (config["data"], config["trajectory"],
+                                        config["training"], config["mlflow"])
+        if not all(isinstance(section, dict) for section in (data, traj, training, mlflow)):
+            raise ValueError("data, trajectory, training, and mlflow sections must be objects")
+        if not isinstance(mlflow.get("tracking_uri"), str) or not mlflow["tracking_uri"]:
+            raise ValueError("mlflow.tracking_uri must be a non-empty local path or file URI")
+        if not isinstance(mlflow.get("experiment_name"), str) or not mlflow["experiment_name"].strip():
+            raise ValueError("mlflow.experiment_name must be a non-empty string")
+        try:
+            normalize_local_tracking_uri(mlflow["tracking_uri"], base_dir=ROOT)
+        except ValueError as exc:
+            raise ValueError(f"mlflow.tracking_uri is invalid: {exc}") from exc
         if not isinstance(data.get("raw_path"), str) or not data["raw_path"]:
             raise ValueError("data.raw_path must be a non-empty path string")
         for key in ("validation_report", "validation_summary", "prepared_dir"):
@@ -122,7 +132,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config, root = load_config(args.config)
-        data, traj, training = config["data"], config["trajectory"], config["training"]
+        data, traj, training, mlflow = (config["data"], config["trajectory"],
+                                        config["training"], config["mlflow"])
         cfg = TrajectoryConfig(traj["input_length"], traj["forecast_horizon"],
                                traj["min_points_per_track"], data["max_animals"])
         data_path = _path(root, getattr(args, "data_path", None) or data["raw_path"])
@@ -182,6 +193,9 @@ def main(argv: list[str] | None = None) -> int:
             "--val-size", str(traj["val_size"]), "--test-size", str(traj["test_size"]),
             "--data-kind", str(training["data_kind"]), "--canonical-output",
             str(_path(root, args.output_dir or training["evaluation_dir"])),
+            "--mlflow-tracking-uri", normalize_local_tracking_uri(
+                mlflow["tracking_uri"], base_dir=root),
+            "--mlflow-experiment-name", mlflow["experiment_name"],
             "--diagnostics-dir", str(_path(root, args.diagnostics_dir or training["diagnostics_dir"])),
             *( ["--strict-determinism"] if training["strict_determinism"] else [] )])
         if cfg.max_animals is None:

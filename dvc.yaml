@@ -16,7 +16,7 @@
     "train": {
       "cmd": "python src/pipeline.py train --config configs/pipeline.json",
       "deps": ["${data.prepared_dir}", "src/pipeline.py", "src/data/data_prep.py", "src/data/validation.py", "src/models/train.py", "src/models/model.py", "src/models/baseline.py", "src/monitoring/metrics.py", "requirements.txt"],
-      "params": [{"configs/pipeline.json": ["data.prepared_dir", "data.max_animals", "trajectory.input_length", "trajectory.forecast_horizon", "trajectory.min_points_per_track", "trajectory.val_size", "trajectory.test_size", "training.seed", "training.batch_size", "training.epochs", "training.learning_rate", "training.hidden_size", "training.num_layers", "training.dropout", "training.num_workers", "training.device", "training.data_kind", "training.strict_determinism", "training.evaluation_dir", "training.diagnostics_dir"]}],
+      "params": [{"configs/pipeline.json": ["data.prepared_dir", "data.max_animals", "trajectory.input_length", "trajectory.forecast_horizon", "trajectory.min_points_per_track", "trajectory.val_size", "trajectory.test_size", "training.seed", "training.batch_size", "training.epochs", "training.learning_rate", "training.hidden_size", "training.num_layers", "training.dropout", "training.num_workers", "training.device", "training.data_kind", "training.strict_determinism", "training.evaluation_dir", "training.diagnostics_dir", "mlflow.tracking_uri", "mlflow.experiment_name"]}],
       "outs": ["${training.evaluation_dir}/trajectory_lstm.pt", "${training.evaluation_dir}/experiment_summary.json", "${training.evaluation_dir}/experiment_report.md"]
     }
   }

@@ -75,7 +75,8 @@ class DvcStructureTests(unittest.TestCase):
             "training.seed", "training.batch_size", "training.epochs", "training.learning_rate",
             "training.hidden_size", "training.num_layers", "training.dropout", "training.num_workers",
             "training.device", "training.data_kind", "training.strict_determinism",
-            "training.evaluation_dir", "training.diagnostics_dir"})
+            "training.evaluation_dir", "training.diagnostics_dir",
+            "mlflow.tracking_uri", "mlflow.experiment_name"})
 
     def test_graph_has_only_expected_json_yaml_fields(self):
         self.assertEqual(set(self.graph), {"vars", "stages"})
@@ -95,8 +96,10 @@ class DvcStructureTests(unittest.TestCase):
         gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("!data/raw/*.dvc", gitignore)
         self.assertIn("!data/processed/*.dvc", gitignore)
-        self.assertIn("artifacts/pipeline/*", gitignore)
-        self.assertIn("!artifacts/pipeline/*.dvc", gitignore)
+        self.assertIn("artifacts/pipeline/**", gitignore)
+        self.assertIn("!artifacts/pipeline/**/", gitignore)
+        self.assertIn("!artifacts/pipeline/**/*.dvc", gitignore)
+        self.assertIn("*.pt", gitignore)
         self.assertIn("data/raw/*", gitignore)
         self.assertIn("data/processed/*", gitignore)
         local_rules = (ROOT / ".dvc/.gitignore").read_text(encoding="utf-8")

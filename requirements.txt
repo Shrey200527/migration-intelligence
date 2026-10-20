@@ -5,3 +5,4 @@ torch
 scikit-learn
 matplotlib
 dvc>=3.67.1,<4
+mlflow>=3.17.1,<4

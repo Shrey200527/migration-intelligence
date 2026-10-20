@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -158,8 +159,9 @@ class PhaseOneTests(unittest.TestCase):
                 "--forecast-horizon", "2", "--min-points", "5", "--max-animals", "2",
                 "--batch-size", "8", "--epochs", "1", "--hidden-size", "4", "--num-layers", "1",
                 "--dropout", "0", "--device", "cpu", "--out-dir", str(root / "runs"), "--data-kind", "synthetic"])
-            run_dir = run_training(args)
-            repeat_run_dir = run_training(args)
+            with patch("src.models.train._load_mlflow", return_value=None):
+                run_dir = run_training(args)
+                repeat_run_dir = run_training(args)
             for name in ("trajectory_lstm.pt", "dataset_quality.json", "experiment_summary.json", "experiment_report.md"):
                 self.assertTrue((run_dir / name).is_file())
             summary = json.loads((run_dir / "experiment_summary.json").read_text())

@@ -1,6 +1,6 @@
 # Migration Intelligence - Phase 2 pipeline interfaces
 
-The project provides a scientific baseline for GPS trajectory forecasting and local scriptable stage interfaces: dataset checks, chronological sequence construction, persisted split artifacts, an LSTM, a persistence baseline, and geographic evaluation. DVC orchestrates the local validation, preparation, and training stages. MLflow is not included.
+The project provides a scientific baseline for GPS trajectory forecasting and local scriptable stage interfaces: dataset checks, chronological sequence construction, persisted split artifacts, an LSTM, a persistence baseline, and geographic evaluation. DVC orchestrates the local validation, preparation, and training stages. MLflow records each executed training run locally; no hosted tracking service or credentials are required.
 
 ## Dataset
 
@@ -71,6 +71,7 @@ No real Movebank dataset is checked into this repository. Synthetic tests valida
 - `data.raw_path`, `data.max_animals`, `data.validation_report`, `data.validation_summary`, `data.prepared_dir`
 - `trajectory.input_length`, `trajectory.forecast_horizon`, `trajectory.min_points_per_track`, `trajectory.val_size`, `trajectory.test_size`
 - `training.seed`, `batch_size`, `epochs`, `learning_rate`, `hidden_size`, `num_layers`, `dropout`, `num_workers`, `device`, `data_kind`, `strict_determinism`, `evaluation_dir`, and `diagnostics_dir`
+- `mlflow.tracking_uri` (local directory or `file:` URI) and `mlflow.experiment_name`
 
 Run from the repository root with the existing environment:
 
@@ -91,6 +92,28 @@ The explicit defaults can be overridden per stage, for example `--data-path C:\d
 Preparation writes `train.npz`, `validation.npz`, `test.npz`, and `manifest.json` to `data.prepared_dir`. Each compressed NPZ contains only `past` and `future` float32 arrays, with shapes `(sequence_count, input_length, 2)` and `(sequence_count, forecast_horizon, 2)` and feature order latitude then longitude. Loading uses `allow_pickle=False` and checks shapes, dtypes, finite/ranged coordinates, manifest counts, and configuration. The manifest contains split settings and aggregate sequence metadata, not GPS rows or animal identifiers. NPZ members use fixed ZIP timestamps so identical arrays produce stable files. Preparation also writes the aggregate validation report beside the arrays for convenient lineage.
 
 The train stage consumes these prepared files without opening or preprocessing the raw CSV. It writes canonical pipeline outputs to `artifacts/pipeline/evaluation` (checkpoint, JSON summary, and Markdown report). Runtime timings are written separately to `artifacts/pipeline/diagnostics/runtime_diagnostics.json`; they are excluded from canonical summaries. Repeated canonical CPU training with identical prepared files and settings produced byte-identical checkpoints in the regression test for the installed software environment. This is not a cross-version or cross-platform guarantee. The legacy `python -m src.models.train --data-path ...` workflow remains available and continues to create unique per-run directories under `artifacts/experiments`, retaining elapsed-time fields in its experiment reports.
+
+Training uses a local SQLite backend by default at `mlruns/mlflow.db`, resolved from the repository root for pipeline runs and standalone CLI defaults. Experiment artifacts are stored in the local `mlruns/artifacts/` directory. The experiment name defaults to `migration-intelligence`. Override `mlflow.tracking_uri` and `mlflow.experiment_name` in `configs/pipeline.json`; standalone training also accepts `--mlflow-tracking-uri` and `--mlflow-experiment-name`. Tracking accepts local SQLite database paths or SQLite URIs and rejects filesystem tracking URIs and hosted services. MLflow records actual training settings and model configuration, per-epoch training and validation MSE, the best validation loss, and explicitly named held-out test metrics (including ADE/FDE when evaluation completes). It logs the selected checkpoint and existing summary/report files, but no row-level GPS data or dataset-quality report. MLflow is optional at runtime for backward compatibility: install `requirements.txt` to enable tracking; without MLflow, training still runs and emits a warning.
+
+Install the declared dependencies in the project virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Then run `dvc repro` to execute and track the pipeline. A DVC cache hit skips training, so it does not create an MLflow run; use `dvc repro --force train` when you intentionally want to execute training again. To run the legacy standalone interface with local tracking:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.models.train --data-path .\data\raw\movebank.csv --device cpu --mlflow-tracking-uri .\mlruns --mlflow-experiment-name migration-intelligence
+```
+
+Open the local SQLite-backed experiment UI in a second terminal:
+
+```powershell
+.\.venv\Scripts\mlflow.exe ui --backend-store-uri sqlite:///mlruns/mlflow.db --host 127.0.0.1 --port 5000
+```
+
+Visit `http://127.0.0.1:5000`. DVC remains responsible for stage dependencies, cache, and declared pipeline outputs; MLflow records parameters, metrics, and useful artifacts for executions that actually run. Their local stores are independent, and no DVC remote or hosted MLflow service is configured.
 
 The pipeline stages are validation (raw CSV to quality JSON/Markdown), preparation (raw CSV and validation report to split arrays, manifest, and copied quality report), and training/evaluation (prepared arrays to checkpoint and evaluation report). Pipeline validation adds a streaming SHA-256 fingerprint of the source CSV to the aggregate report. Preparation compares the current CSV fingerprint, filename, trajectory settings, and split ratios before reusing a report; an old report without a fingerprint is rejected. When run by itself without a report, preparation validates the CSV in memory and writes its quality report only inside the prepared output directory. DVC also tracks the CSV and validation JSON dependency, so it schedules validation before preparation when the raw file changes.
 
